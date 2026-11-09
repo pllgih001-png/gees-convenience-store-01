@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+/*
+ * GEES Convenience Store — design tokens.
+ * Values verified from the reference site's compiled CSS (see docs/IMPLEMENTATION_PLAN.md §8).
+ * Stored as raw HSL channels so Tailwind v4 can compose them, e.g. bg-primary, text-primary-foreground.
+ */
+:root {
+  --background: 40 39.1% 95.5%;
+  --foreground: 260 6.4% 9.2%;
+  --card: 40 39.1% 95.5%;
+  --card-foreground: 222.2 84% 4.9%;
+  --popover: 40 39.1% 95.5%;
+  --popover-foreground: 222.2 84% 4.9%;
+  --primary: 348 68.2% 17.3%;
+  --primary-foreground: 40 39.1% 95.5%;
+  --secondary: 37.5 32% 90.2%;
+  --secondary-foreground: 240 15.8% 3.7%;
+  --muted: 37.5 32% 90.2%;
+  --muted-foreground: 348 68.2% 17.3%;
+  --accent: 34.8 50.6% 65.9%;
+  --accent-foreground: 222.2 84% 4.9%;
+  --destructive: 0 84.2% 60.2%;
+  --destructive-foreground: 210 40% 98%;
+  --border: 37.5 32% 90.2%;
+  --input: 214.3 31.8% 91.4%;
+  --ring: 348 68.2% 17.3%;
+
+  --radius: 0; /* reference uses sharp corners throughout */
+}
+
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+
+  --radius-sm: var(--radius);
+  --radius-md: var(--radius);
+  --radius-lg: var(--radius);
+  --radius-xl: var(--radius);
+
+  --font-sans: var(--font-body);
+  --font-serif: var(--font-heading);
+}
+
+@layer base {
+  *,
+  ::before,
+  ::after {
+    border-color: hsl(var(--border));
+  }
+
+  body {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-family: var(--font-body), system-ui, sans-serif;
+  }
+}

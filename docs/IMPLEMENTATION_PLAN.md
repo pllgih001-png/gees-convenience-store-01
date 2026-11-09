@@ -1,8 +1,27 @@
 # GEES Convenience Store — Implementation & Migration Plan
 
-Status: **v2 — UPDATED with approved decisions (2026-11-09). Awaiting explicit approval before implementation. The original Base44 site is untouched.**
+Status: **v2 — approved. Stage 1 (foundation & configuration) complete. The original Base44 site is untouched.**
 
 Legend: **VERIFIED** = read directly from the live app's JavaScript bundle / public API. **DECIDED** = instructed by the store owner.
+
+---
+
+## 0. Delivery stages (DECIDED — staged rollout)
+
+Each stage is implemented, tested and committed separately. The Base44 site stays online and untouched throughout; nothing is deployed to the real domain or made public until reviewed.
+
+| Stage | Scope | Status |
+|---|---|---|
+| 1 | Project foundation & configuration (Next.js + TS + Tailwind, design tokens, fonts, env template, lint/build) | ✅ complete |
+| 2 | Supabase project, schema, RLS, migrations, seed + verification script | pending |
+| 3 | Layout shell: header (nav + search), footer, announcement bar, cart provider/drawer skeleton, UI primitives | pending |
+| 4 | Home page (hero, promise, categories, New In, experience, delivery, refund) | pending |
+| 5 | Shop (filters/sort) + product detail + header search results | pending |
+| 6 | Build A Box (sizes 5/10/15, themes) | pending |
+| 7 | Auth pages + customer Account | pending |
+| 8 | Cart drawer + guest checkout + order creation + Yoco redirect + transactional email | pending |
+| 9 | Admin dashboard (Overview/Products/Orders/Emails/Categories/Build a Box/Settings) | pending |
+| 10 | Data + asset migration, verification, pixel-parity QA | pending |
 
 ---
 
