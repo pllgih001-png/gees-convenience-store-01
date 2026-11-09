@@ -1,47 +1,63 @@
 # GEES Convenience Store — Implementation & Migration Plan
 
-Status: **DRAFT — awaiting approval. No implementation has started. The original Base44 site is untouched.**
+Status: **v2 — UPDATED with approved decisions (2026-11-09). Awaiting explicit approval before implementation. The original Base44 site is untouched.**
+
+Legend: **VERIFIED** = read directly from the live app's JavaScript bundle / public API. **DECIDED** = instructed by the store owner.
 
 ---
 
-## 1. Goals & constraints
+## 1. Goals, constraints & locked decisions
 
 | # | Requirement | How it is met |
 |---|---|---|
-| 1 | Base44 site is source of truth | Content/data extracted verbatim from the live app (see §6) |
-| 2 | Do not modify the original | We only read it; no writes to Base44 |
+| 1 | Base44 site is source of truth | Content/data extracted verbatim from the live app (§6) |
+| 2 | Never modify the original | Read-only access; no writes to Base44 |
 | 3 | Independent recreation | New Next.js app in this repo, built from scratch |
 | 4 | Preserve pages/functionality/nav/type/colour/spacing/identity | Route + component + token parity (§5, §7, §8) |
 | 5 | Keep customer accounts + private admin dashboard | Supabase Auth + role-gated Admin (§10) |
 | 6 | Keep Build A Box incl. themes + packs of 5/10/15 | §7.4 |
 | 7 | Keep cart, guest checkout, order creation, Yoco flow | §9 |
-| 8 | Do not invent products/prices/categories/business info | Only the real 25 products / 5 categories / 4 themes / settings |
-| 9 | Do not remove or simplify functionality | Parity checklist §12 |
-| 10 | No Base44 branding | Assets re-hosted in Supabase Storage; no Base44 SDK/CDN |
+| 8 | Do not invent products/prices/categories/business info | Only the real 25/5/4 + settings (§6) |
+| 9 | Never remove or simplify existing functionality | Parity checklist §12 |
+| 10 | No Base44 branding | Assets re-hosted; no Base44 SDK/CDN (§6) |
 
-**Stack:** Next.js (App Router) + TypeScript · Supabase (DB + Auth + Storage) · Vercel (hosting) · GitHub (source) · Yoco hosted payment link `https://pay.yoco.com/gees-convenience-store`.
+**Stack (DECIDED):** Next.js (App Router) + TypeScript · Supabase (Postgres + Auth + Storage) · Vercel (hosting) · GitHub (source) · Yoco hosted payment link `https://pay.yoco.com/gees-convenience-store`.
+
+**Locked decisions (DECIDED):**
+
+| Item | Decision |
+|---|---|
+| Transactional email | Keep it, via **Resend**. Dev must work **without a paid subscription** (§10A) |
+| First admin | The store owner; secure provisioning, **no hardcoded credentials** (§10B) |
+| `payment_status` values | Taken from the bundle only — `unpaid`, `paid`, `failed` (**VERIFIED**) |
+| Header product search | Preserved (**VERIFIED** it exists) |
+| Social links | Generic/fake links removed; hidden until real handles are supplied (§10C) |
+| Existing orders | Migrate only if genuinely accessible; otherwise await owner export (§6) |
+| Visual fidelity | Closest reasonably achievable pixel-level fidelity |
+
+**Hard rules (DECIDED, non-negotiable):** service-role keys never in frontend code (§10D) · customer data protected by server-side authorization + RLS (§10E) · never modify the Base44 site · never replace or simplify existing functionality.
 
 ---
 
 ## 2. Source-of-truth inventory (Base44 app)
 
-- App id: `6ad9e0622e1cb646cfcf950f`; host `captured-gees-curated-experience-m-cfcf950f.base44.app`
-- Front-end: React SPA (Vite). Public REST API for entities is readable (used only to extract data).
-- **Entities:** `Product`, `Category`, `BoxTheme`, `Order`, `StoreSetting`, `EmailSetting`, `EmailLog`, plus user auth.
-- **Routes found:** `/`, `/Shop`, `/product/:id`, `/BuildABox`, `/Account` (protected), `/Admin` (protected), `/login`, `/register`, `/forgot-password`, `/reset-password`, `*` (404).
-- **Data volume:** 25 products · 5 categories · 4 box themes · store settings (defaults) · orders/email logs returned empty publicly.
-- **Assets:** 1 logo PNG + 25 product images on `media.base44.com` (no hero image; no CSS background images).
+- App id `6ad9e0622e1cb646cfcf950f`; host `captured-gees-curated-experience-m-cfcf950f.base44.app`.
+- Front-end: React SPA (Vite). Public entity REST API is readable; used only to extract data.
+- **Entities:** `Product`, `Category`, `BoxTheme`, `Order`, `StoreSetting`, `EmailSetting`, `EmailLog`, + user auth.
+- **Routes (VERIFIED):** `/`, `/Shop`, `/product/:id`, `/BuildABox`, `/Account` (protected), `/Admin` (protected), `/login`, `/register`, `/forgot-password`, `/reset-password`, `*` (404).
+- **Data volume (VERIFIED):** 25 products · 5 categories · 4 box themes · `StoreSetting`/`EmailSetting`/`EmailLog`/`Order` rows **all returned empty** (not publicly readable) · settings currently come from built-in defaults.
+- **Assets (VERIFIED):** 1 logo PNG + 25 product images on `media.base44.com` = **26 assets**. No hero image; no CSS background images.
 
 ---
 
 ## 3. Target architecture
 
-- **Rendering:** Next.js App Router. Storefront pages render on the server (SEO) with client interactivity for cart/box/admin.
-- **Data:** Supabase Postgres, accessed with `@supabase/ssr` (server + browser clients). RLS for public read of catalog and protected writes.
-- **Auth:** Supabase Auth (email + password), session via cookies, route protection in `middleware.ts`.
-- **Storage:** Supabase Storage buckets `product-images` and `brand` for migrated assets.
-- **Payments:** unchanged — create order, then redirect the customer to the Yoco hosted link (`payment_link`).
-- **Emails:** Base44 previously handled transactional email; Supabase does not. Requires a provider (see §13, open item).
+- **Rendering:** Next.js App Router, server-rendered storefront (SEO) + client interactivity for cart / box builder / admin.
+- **Data:** Supabase Postgres via `@supabase/ssr`. RLS for catalog reads; all privileged writes server-side.
+- **Auth:** Supabase Auth (email + password, cookie sessions); route protection in `middleware.ts`.
+- **Storage:** Supabase Storage buckets `product-images`, `brand`.
+- **Payments:** unchanged — create order, redirect to the Yoco hosted link.
+- **Email:** Resend behind an abstraction (see §10A).
 
 ---
 
@@ -52,40 +68,40 @@ gees-convenience-store-01/
 ├─ package.json · next.config.ts · tsconfig.json · postcss.config.mjs
 ├─ .gitignore · .env.local.example
 ├─ docs/IMPLEMENTATION_PLAN.md
-├─ public/brand/…                       # migrated logo
+├─ public/brand/…                        # migrated logo
+├─ migration/
+│  ├─ source-snapshot/{products,categories,box_themes}.json   # raw Base44 export (v1, immutable)
+│  └─ assets-manifest.json               # filename → SHA-256 → new storage path
+├─ scripts/
+│  ├─ export-base44.ts                   # one-way read of the public API
+│  ├─ verify-migration.ts                # counts, checksums, price parity (§6)
+│  └─ promote-admin.ts                   # secure first-admin provisioning (§10B)
 ├─ supabase/
-│  ├─ migrations/0001_init.sql          # tables, enums, RLS, triggers
+│  ├─ migrations/0001_init.sql           # tables, enums, RLS, triggers
 │  └─ seed/{products,categories,box_themes,store_settings}.json
 └─ src/
-   ├─ middleware.ts                     # auth + admin guards
+   ├─ middleware.ts                      # auth + admin guards
    ├─ app/
-   │   ├─ layout.tsx                    # fonts, Providers, Header, Footer
-   │   ├─ globals.css                   # design tokens (§8)
-   │   ├─ page.tsx                      # / Home
-   │   ├─ Shop/page.tsx                 # /Shop
-   │   ├─ product/[id]/page.tsx         # /product/:id
-   │   ├─ BuildABox/page.tsx            # /BuildABox
-   │   ├─ Account/page.tsx              # protected
-   │   ├─ Admin/page.tsx                # protected (role = admin)
-   │   ├─ login|register|forgot-password|reset-password/page.tsx
-   │   └─ not-found.tsx                 # 404
+   │  ├─ layout.tsx · globals.css · page.tsx (Home)
+   │  ├─ Shop/page.tsx · product/[id]/page.tsx · BuildABox/page.tsx
+   │  ├─ Account/page.tsx (protected) · Admin/page.tsx (admin only)
+   │  ├─ login|register|forgot-password|reset-password/page.tsx
+   │  └─ not-found.tsx
    ├─ components/
-   │   ├─ layout/{Header,Footer,MobileNav}.tsx
-   │   ├─ cart/{CartProvider,CartDrawer}.tsx
-   │   ├─ shop/{ProductCard,FilterTabs,SortSelect,ProductGrid}.tsx
-   │   ├─ home/{Hero,CategoryGrid,NewInGrid,Promise,Experience,DeliveryPolicy}.tsx
-   │   ├─ box/{BoxBuilder,SizePicker,ThemePicker,ItemPicker,BoxSummary}.tsx
-   │   ├─ admin/{AdminTabs,OverviewTab,ProductsTab,CategoriesTab,BoxThemesTab,OrdersTab,EmailsTab,SettingsTab}.tsx
-   │   └─ ui/                           # shadcn/Radix primitives (button, input, textarea, sheet, dialog, select, badge…)
+   │  ├─ layout/{Header,Footer,MobileNav}.tsx      # header search lives here
+   │  ├─ cart/{CartProvider,CartDrawer}.tsx
+   │  ├─ shop/{ProductCard,FilterTabs,SortSelect,ProductGrid,SearchOverlay}.tsx
+   │  ├─ home/{Hero,CategoryGrid,NewInGrid,Promise,Experience,DeliveryPolicy}.tsx
+   │  ├─ box/{BoxBuilder,SizePicker,ThemePicker,ItemPicker,BoxSummary}.tsx
+   │  ├─ admin/{AdminTabs,OverviewTab,ProductsTab,CategoriesTab,BoxThemesTab,OrdersTab,EmailsTab,SettingsTab}.tsx
+   │  └─ ui/                                       # Radix/shadcn-style primitives
    └─ lib/
-      ├─ supabase/{client,server,middleware}.ts
-      ├─ cart-store.ts                  # localStorage persistence
-      ├─ format.ts                      # ZAR formatter (reference uses `R${n}`)
-      ├─ orders.ts                      # createOrder + reference generation
-      └─ types.ts
+      ├─ supabase/{client,server,admin,middleware}.ts   # admin.ts = service-role, SERVER ONLY
+      ├─ cart-store.ts · format.ts · orders.ts · types.ts
+      └─ email/{transport.ts,resend.ts,dev.ts,templates.ts}   # §10A
 ```
 
-**Dependencies (kept minimal):** `next`, `react`, `react-dom`, `typescript`, `tailwindcss`, `@supabase/supabase-js`, `@supabase/ssr`, `lucide-react` (icons used by reference), Radix primitives for sheet/dialog/select/dropdown (as in reference), `clsx` + `tailwind-merge`. **Not** included: Base44 SDK, React Router, react-query, socket.io (all Base44-runtime only).
+**Dependencies (minimal):** `next`, `react`, `react-dom`, `typescript`, `tailwindcss`, `@supabase/supabase-js`, `@supabase/ssr`, `lucide-react`, Radix primitives (sheet, dialog, select, dropdown), `clsx`, `tailwind-merge`, `resend`. **Not** included: Base44 SDK, React Router, react-query, socket.io.
 
 ---
 
@@ -93,111 +109,172 @@ gees-convenience-store-01/
 
 | Reference entity | Supabase table | Columns |
 |---|---|---|
-| `Product` | `products` | `id uuid`, `name text`, `description text`, `price numeric(10,2)`, `category_slug text → categories.slug`, `image_url text`, `stock int`, `is_new bool`, `is_trending bool`, `box_eligible bool`, `created_at`, `updated_at` |
-| `Category` | `categories` | `id uuid`, `name text`, `slug text unique`, `sort_order int` |
-| `BoxTheme` | `box_themes` | `id uuid`, `name text`, `description text`, `categories text[]` |
-| `Order` | `orders` | `id uuid`, `order_reference text unique`, `user_id uuid null → auth.users`, `customer_name`, `customer_email`, `phone`, `address`, `city`, `province`, `postal_code`, `gift_note`, `items jsonb`, `subtotal numeric`, `delivery_fee numeric`, `total numeric`, `status order_status`, `payment_status payment_status`, `created_at`, `updated_at` |
-| `StoreSetting` | `store_settings` | singleton: `id`, `delivery_fee numeric`, `payment_link text`, (other fields as found in Admin → Settings) |
-| `EmailSetting` | `email_settings` | `id`, `type email_type`, `subject text`, `body text`, `enabled bool` |
-| `EmailLog` | `email_logs` | `id`, `type email_type`, `to_email`, `order_reference`, `status text(sent/failed)`, `error text`, `created_at` |
-| `User` | `auth.users` + `profiles` | `profiles(id → auth.users, role text('customer'|'admin'), full_name, …)` |
+| `Product` | `products` | `id uuid`, `name`, `description`, `price numeric(10,2)`, `category_slug → categories.slug`, `image_url`, `stock int`, `is_new bool`, `is_trending bool`, `box_eligible bool`, `created_at`, `updated_at` |
+| `Category` | `categories` | `id`, `name`, `slug unique`, `sort_order int` |
+| `BoxTheme` | `box_themes` | `id`, `name`, `description`, `categories text[]` |
+| `Order` | `orders` | `id`, `order_reference unique`, `user_id → auth.users (null for guest)`, `customer_name`, `customer_email`, `phone`, `address`, `city`, `province`, `postal_code`, `gift_note`, `items jsonb`, `subtotal`, `delivery_fee`, `total`, `status order_status`, `payment_status payment_status`, `created_at`, `updated_at` |
+| `StoreSetting` | `store_settings` | singleton: `delivery_fee numeric`, `store_name`, `slogan`, `delivery_info`, `refund_policy`, `privacy_policy`, `terms`, `contact_email`, `contact_phone`, `payment_link`, + `social_instagram/social_facebook/social_tiktok` (nullable, §10C) |
+| `EmailSetting` | `email_settings` | `id`, `type email_type`, `subject text`, `html text`, `enabled bool` |
+| `EmailLog` | `email_logs` | `id`, `type email_type`, `to_email`, `order_reference`, `status text`, `error text`, `attempts int`, `created_at` |
+| `User` | `auth.users` + `profiles` | `profiles(id → auth.users, role 'customer'\|'admin', full_name, created_at)` |
 
-**Enums (from the reference build):**
+**Enums (VERIFIED from the bundle):**
 - `order_status`: `pending_payment`, `paid`, `processing`, `shipped`, `delivered`, `cancelled`
+- `payment_status`: `unpaid`, `paid`, `failed`
 - `email_type`: `order_confirmation`, `payment_confirmation`, `status_received`, `status_processing`, `status_dispatched`, `status_delivered`, `status_cancelled`, `welcome`
-- `payment_status` options: **to confirm** from Admin UI (values not yet captured).
 
-**RLS:** `products`, `categories`, `box_themes`, public `store_settings` → public `SELECT`; writes admin-only. `orders` → insert public (guest checkout), select owner-or-admin, update admin-only. `email_*` → admin-only.
+**Store defaults (VERIFIED, `wz` object in bundle):**
+```
+delivery_fee   100
+store_name     "GEES Convenience Store"
+slogan         "Everything you didn't know you needed."
+delivery_info  "Standard delivery R100. Estimated delivery up to two weeks within South Africa."
+refund_policy  ""            privacy_policy ""      terms ""
+contact_email  "geesconveniencestore01@gmail.com"   contact_phone ""
+payment_link   "https://pay.yoco.com/gees-convenience-store"
+```
+
+**RLS summary (detail in §10E):** catalog + public store fields → public `SELECT`; catalog writes admin-only; `orders` → public `INSERT` (guest checkout), `SELECT` owner-or-admin, `UPDATE` admin-only; `email_*` → admin-only; `profiles` → self-read, role change blocked for non-service callers.
 
 ---
 
-## 6. Data migration
+## 6. Data migration & verification
 
-**Captured from the live app (verbatim, not invented):**
+**Captured from the live app (verbatim, not invented — DECIDED to migrate as-is):**
 
-- **25 products** — see `supabase/seed/products.json` to be generated from the captured export. Fields: name, description, price, category, image_url, stock, is_new, is_trending, box_eligible. Price range R69–R624; 21 of 25 are `box_eligible`; 1 product has `stock = 0`.
-- **5 categories** (sort order): 1 Gifts `gifts` · 2 Books & Stationery `books-stationery` · 3 Home `home` · 4 Beauty `beauty` · 5 Accessories `accessories`.
-- **4 box themes:** Shine On `[accessories,beauty]` · Cosy Home `[home]` · Desk & Dream `[books-stationery]` · Self-Care Sunday `[beauty,gifts]`.
-- **Store settings:** `delivery_fee = 100`, `payment_link = https://pay.yoco.com/gees-convenience-store` (defaults; the `StoreSetting` row is empty, so these are the app defaults).
-- **Orders / email logs:** not publicly readable → nothing to migrate (confirm with owner whether any real orders exist).
-- **Assets:** 25 product images + 1 logo → download from `media.base44.com`, upload to Supabase Storage, rewrite all URLs (satisfies "no Base44 branding/dependency").
+- **25 products** (VERIFIED) — name, description, price, category, image_url, stock, is_new, is_trending, box_eligible. Price range **R69–R624**; **21/25** `box_eligible`; **1** product `stock = 0`.
+- **5 categories** (VERIFIED, sort order): 1 Gifts `gifts` · 2 Books & Stationery `books-stationery` · 3 Home `home` · 4 Beauty `beauty` · 5 Accessories `accessories`.
+- **4 box themes** (VERIFIED): Shine On `[accessories,beauty]` · Cosy Home `[home]` · Desk & Dream `[books-stationery]` · Self-Care Sunday `[beauty,gifts]`.
+- **Store settings:** the built-in defaults above (no `StoreSetting` row exists).
+- **Orders / email logs:** currently **empty / not publicly readable**. There is nothing accessible to migrate. **DECIDED:** migrate genuine existing orders **if** the owner supplies an authenticated export from Base44 (see §6.2). Until then, `orders`/`email_logs` start empty.
+- **Assets:** 26 files → `media.base44.com`.
 
-**Migration steps (executed only after approval):**
-1. Export entity JSON → transform to seed SQL/JSON (`supabase/seed/*`).
-2. Download assets → `public/brand/` + Supabase Storage `product-images`.
-3. Apply `0001_init.sql`, run seed, verify counts (25/5/4) and price parity.
+**6.1 Assets & verification (REQUIREMENT #4)**
+
+1. Download all 26 assets → `migration/assets/` + upload to Supabase Storage (`product-images`, `brand`).
+2. Record `migration/assets-manifest.json`: original URL → local filename → **SHA-256** → new public URL.
+3. Rewrite every `image_url` to the Supabase URL; assert **zero** `media.base44.com` references remain in code/data.
+4. `scripts/verify-migration.ts` asserts: products = **25**, categories = **5**, box themes = **4**, assets = **26**, every stored asset returns HTTP 200, and a per-product **price parity** diff (old vs. new) is empty.
+
+**6.2 Orders migration (DECIDED, conditional)**
+
+- Path A (preferred if owner can export): owner exports `Order` rows (CSV/JSON) from Base44 admin → `scripts/import-orders.ts` maps to the `orders` schema (status/payment_status preserved verbatim from the allowed enums), assigning `user_id` where the email matches a registered profile, else guest.
+- Path B (no export): start empty; historical order history is not fabricated.
+- Either way, verify imported count against the owner-supplied source before going live.
+
+**6.3 Backups before migration (REQUIREMENT #3)**
+
+- **Source snapshot (immutable):** commit the raw Base44 entity export to `migration/source-snapshot/` (v1) — never edited afterwards, so the migration is always reproducible.
+- **Assets:** archive the 26 originals + SHA-256 manifest before any upload; keep the archive outside git (storage bucket / owner drive).
+- **Supabase DB:** take a `supabase db dump` (schema + data) **before** first seed and **after** each migration; enable scheduled backups / PITR per plan tier; keep all SQL migrations in git.
+- **Secrets:** `.env.local` and Vercel env vars are backed up to the owner's password manager; `.env*` is git-ignored.
+- **Rollback:** because seed data is reproducible from the snapshot, rollback = drop/re-seed on a fresh project.
 
 ---
 
 ## 7. Routes & page specs
 
 ### 7.1 `/` Home
-Announcement bar ("GEES GOES WHERE YOU GO. DELIVERY ACROSS SOUTH AFRICA") · Header (logo "GEES / CONVENIENCE STORE", nav, search, account, bag) · Hero ("EVERYTHING YOU DIDN'T KNOW YOU NEEDED." + SHOP NOW) · "The Gees Promise" (HAND-PICKED / GIFT-READY) · **Shop by category** (5 categories + "Build a Box" card) · **New In** (JUST LANDED, up to 12 latest, VIEW ALL → `/Shop?sort=new`) · "The Gees Experience" (4 promise items) · "GEES goes where you go" delivery/refund block · Footer (The Gees List signup, contact email, socials).
+Announcement bar ("GEES GOES WHERE YOU GO. DELIVERY ACROSS SOUTH AFRICA") · Header (logo "GEES / CONVENIENCE STORE", nav, **search**, account, bag) · Hero ("EVERYTHING YOU DIDN'T KNOW YOU NEEDED." + SHOP NOW) · "The Gees Promise" (HAND-PICKED / GIFT-READY) · Shop by category (5 categories + "Build a Box" card) · New In (JUST LANDED, up to 12 latest, VIEW ALL → `/Shop?sort=new`) · "The Gees Experience" ("You came for one thing. You're leaving with five." + 4 items: Carefully packed / Hand-picked / Gift-ready / Nationwide delivery) · "GEES goes where you go" delivery block + refund policy · Footer (contact `geesconveniencestore01@gmail.com`, socials per §10C).
 
 ### 7.2 `/Shop`
-Tabs: ALL · NEW IN (`?view=new`) · TRENDING (`?view=trending`) · categories (`?category=…`). Sort: Featured / Price ↑ / Price ↓. Product count ("25 products"). Grid of product cards (image, NEW IN badge, name, price, stock).
+Tabs: ALL · NEW IN (`?view=new`) · TRENDING (`?view=trending`) · categories (`?category=…`). Sort: Featured / Price ↑ / Price ↓. Count line ("25 products"). Product grid (image, NEW IN badge, name, price, stock).
 
 ### 7.3 `/product/[id]`
-Category label · name · price · stock state (In stock / Out of stock) · description · delivery note · **ADD TO BAG**. Image gallery.
+Category label · name · price · stock state (In stock / Out of stock) · description · delivery note · **ADD TO BAG**.
 
 ### 7.4 `/BuildABox`
-Step 1 box size: **5 / 10 / 15 items** · Step 2 optional theme (4 themes, filtered to their categories) · Step 3 add products (category filter, per-item qty counters, "add same product more than once") · sticky "Your Box" panel (`n / size items`, remaining count, box total, delivery R100 note). Box added to bag as a single line item (contents incl. item counts).
+1 Box size **5 / 10 / 15** · 2 optional theme (4 themes, filtered to their categories) · 3 add products (category filter, per-item qty, same product repeatable) · sticky "Your Box" panel (`n / size`, remaining, box total, R100 delivery note). Box is added to the bag as one line item with contents.
 
 ### 7.5 `/Account` (protected)
-Signed-in order history: reference, date, item count, total, status badge; expandable item/address detail. Logout.
+Order history: reference, date, item count, total, status badge; expandable item/address detail. Logout.
 
-### 7.6 `/Admin` (protected, admin only)
-Tabs (labels from reference): **Overview** (analytics) · **Products** · **Orders** · **Emails** · **Categories** · **Build a Box** · **Settings**.
-- Orders: list + `payment_status` and `status` selects, detail view.
-- Products/Categories/Box Themes: full CRUD.
-- Emails: `EmailSetting` list + `EmailLog` (sent/failed, retry).
-- Settings: store settings (delivery fee, Yoco payment link).
+### 7.6 `/Admin` (admin only)
+Tabs (VERIFIED labels): **Overview** · **Products** · **Orders** · **Emails** · **Categories** · **Build a Box** · **Settings**.
+- Orders: list + `status` and `payment_status` selects (`unpaid`/`paid`/`failed`) + detail.
+- Products / Categories / Box Themes: full CRUD (add, edit, duplicate, hide, delete).
+- Emails: `email_settings` (subject/html/enabled per type) + `email_logs` (sent/failed + Retry).
+- Settings: all `store_settings` fields above.
 
 ### 7.7 Auth pages
 `/login`, `/register`, `/forgot-password`, `/reset-password` — Supabase Auth, same layout/tokens.
 
 ### 7.8 `/not-found`
-404 styled to match.
+404 styled to match (the reference 404 also shows a "Search products" box — reproduce it).
 
 ---
 
-## 8. Design system (tokens from reference CSS)
+## 8. Design system (tokens VERIFIED from reference CSS)
 
 ```
---primary            hsl(348 68.2% 17.3%)   #4A0E20 (deep wine)
---primary-foreground hsl(40 39.1% 95.5%)    cream
---background / --card hsl(40 39.1% 95.5%)   #F5F1E8
---border / --muted   hsl(37.5 32% 90.2%)
---accent             hsl(34.8 50.6% 65.9%)  gold
---muted-foreground   hsl(348 68.2% 17.3%)
---foreground         hsl(260 6.4% 9.2%)
---destructive        hsl(0 84.2% 60.2%)
---radius             0                      (sharp corners)
+--primary             hsl(348 68.2% 17.3%)   deep wine
+--primary-foreground  hsl(40 39.1% 95.5%)    cream
+--background / --card hsl(40 39.1% 95.5%)    cream
+--border / --muted    hsl(37.5 32% 90.2%)
+--accent              hsl(34.8 50.6% 65.9%)  gold
+--muted-foreground    hsl(348 68.2% 17.3%)
+--foreground          hsl(260 6.4% 9.2%)
+--destructive         hsl(0 84.2% 60.2%)
+--radius              0                      sharp corners
 ```
-- **Headings:** Cormorant Garamond 300–700 · **Body:** Jost 300–700 (Google Fonts, self-hosted or via `next/font`).
-- Signature patterns: zero radius, uppercase micro-labels with wide tracking (`tracking-[0.25em]`), serif headings, cream/wine/gold palette, hover `bg-primary/90`.
-- Map tokens to Tailwind theme so all components use semantic classes.
+Headings **Cormorant Garamond**, body **Jost** (via `next/font`). Signature patterns: zero radius, uppercase micro-labels with wide tracking (`tracking-[0.25em]`), serif headings, hover `bg-primary/90`. Tokens mapped into the Tailwind theme.
 
 ---
 
 ## 9. Cart, checkout & Yoco flow (preserved exactly)
 
-- **Cart state:** persisted client-side (localStorage) via `CartProvider`; bag icon with count.
-- **Cart drawer** (right sheet), 3 states: **Your Bag → Checkout → Order received**.
-  - Bag: line items (image, name, qty ±, remove; box items show "n items inside"), Subtotal, Standard delivery, Total (ZAR), note "Estimated delivery: up to 2 weeks. All sales final — no refunds.", CHECKOUT.
+- **Cart state:** localStorage via `CartProvider`; bag icon with count badge.
+- **Cart drawer** (right sheet), 3 states **Your Bag → Checkout → Order received**:
+  - Bag: line items (image, name, qty ±, remove; box items show "n items inside"), Subtotal, Standard delivery, Total (ZAR), "Estimated delivery: up to 2 weeks. All sales final — no refunds.", CHECKOUT.
   - Checkout (guest): Full name, Email (validated), Phone, Street address, City, Province, Postal code, Gift note (optional) → PLACE ORDER.
-  - Result: "Order received — awaiting payment", order reference, amount due, **PAY WITH YOCO** (opens `payment_link`), "use your reference when you pay", CONTINUE BROWSING. Bag retained until payment confirmed.
-- **Order creation:** insert `orders` row with `status = pending_payment`, generated `order_reference`, item snapshot, subtotal/delivery/total. (In the reference this was a client helper; here it becomes a server action / route handler to protect the write.)
-- **Payment:** no webhook — confirmation is manual by admin (unchanged from reference). Admin marks `payment_status`/`status`.
+  - Result: "Order received — awaiting payment", reference, amount due, **PAY WITH YOCO** → `payment_link`, "use your reference when you pay", CONTINUE BROWSING; bag retained until payment confirmed.
+- **Order creation:** server action / route handler inserts the `orders` row (`status = pending_payment`, generated `order_reference`, item snapshot, subtotal/delivery/total) so the write is authorized server-side (§10E), then fire-and-forget email (§10A).
+- **Payment:** no webhook (unchanged); admin confirms manually via `status`/`payment_status`.
 
 ---
 
-## 10. Auth & roles
+## 10. Security, accounts & email
 
-- Supabase Auth (email/password) with cookie sessions.
-- `profiles.role`: `customer` (default) | `admin`.
-- `middleware.ts` guards `/Account` (any signed-in user) and `/Admin` (admin only).
-- Preserve reference behaviours: register, login, forgot/reset password, account order list, admin dashboard access.
+### 10A. Transactional email architecture & failure handling (DECIDED — Resend, no paid subscription required)
+
+- **Abstraction:** `lib/email/transport.ts` exposes `send({type, to, order_reference, data})`. Implementations:
+  - `resend.ts` — used when `RESEND_API_KEY` is set (Resend free tier is sufficient; domain verification optional in dev).
+  - `dev.ts` — default when no key: renders the template, **records the email in `email_logs` with `status = 'skipped'`**, logs to console. **No purchase or subscription needed for development.**
+- **Templates:** one per `email_type` (order_confirmation, payment_confirmation, status_*, welcome), editable in Admin → Emails (`subject`, `html`, `enabled`), mirroring the reference's `EmailSetting`.
+- **Trigger points:** order created · payment marked paid · status changed (received/processing/dispatched/delivered/cancelled) · welcome on registration.
+- **Never blocks the customer flow:** sending is fire-and-forget after the DB write commits; an email failure must not fail checkout or a status change.
+- **Failure handling:** every attempt writes an `email_logs` row (`sent` | `failed` | `skipped`) with `error` + `attempts`. Admin → Emails lists failures and offers **Retry** (idempotent, increments `attempts`). Failures never surface as customer-facing errors.
+- **Env:** `RESEND_API_KEY`, `EMAIL_FROM` (e.g. `GEES <no-reply@…>`), `EMAIL_REPLY_TO` (defaults to the store contact email).
+
+### 10B. Secure first-admin provisioning (DECIDED, REQUIREMENT #1)
+
+- On signup, a DB trigger creates `profiles` with `role = 'customer'` (default). RLS **blocks** any client from changing its own `role`.
+- The store owner registers normally via `/register`, then is promoted **once** using `scripts/promote-admin.ts`:
+  - Requires `SUPABASE_SERVICE_ROLE_KEY` from the environment (server-side only; never bundled).
+  - Usage: `npm run make-admin -- owner@example.com` → sets `role = 'admin'` for that user by email lookup.
+- **No credentials, emails or keys are hardcoded.** The owner's email is passed as a CLI argument at runtime; the script refuses to run without the service-role env var.
+- Documented alternative (equivalent, for operators without the script): a one-time SQL statement in the Supabase SQL editor, e.g.
+  `update public.profiles set role = 'admin' where id = (select id from auth.users where email = 'owner@example.com');`
+- Admin access is additionally re-checked server-side on every `/Admin` request and in every privileged action (§10E).
+
+### 10C. Social links (DECIDED)
+
+- The reference's generic `instagram.com/`, `facebook.com/`, `tiktok.com/` placeholders are **not** carried over.
+- `store_settings` gains nullable `social_instagram` / `social_facebook` / `social_tiktok`.
+- The footer renders a social icon **only if** its URL is set; with none set, **no social links are shown** — until the owner supplies real handles.
+
+### 10D. Service-role key handling (REQUIREMENT #6)
+
+- `SUPABASE_SERVICE_ROLE_KEY` exists **only** in server env (never `NEXT_PUBLIC_*`) and is imported exclusively by `src/lib/supabase/admin.ts`.
+- `admin.ts` is used only inside server actions / route handlers / `scripts/`; it is never imported by a client component (enforced by review + an ESLint `no-restricted-imports` boundary).
+- Any accidental `NEXT_PUBLIC_`-prefixed secret is treated as a leak and rotated.
+
+### 10E. Customer-data privacy: server-side authorization + RLS (REQUIREMENT #5)
+
+- **RLS is the backstop; the server is the authority.** Every privileged action re-verifies the caller's session + role server-side (never trusting client state).
+- Policies: catalog/`store_settings` public `SELECT`; catalog writes admin-only; `orders` public `INSERT`, `SELECT` restricted to `customer_email = auth.jwt()->>'email'` **or** admin, `UPDATE` admin-only; `email_settings`/`email_logs` admin-only; `profiles` self-read with role immutable by clients.
+- Guest checkout inserts with an explicit column allow-list (no client-chosen `status`/`payment_status`); the server sets `pending_payment`/`unpaid`.
+- `orders` never expose other customers' data; admin reads use the service-role server client.
 
 ---
 
@@ -206,50 +283,58 @@ Tabs (labels from reference): **Overview** (analytics) · **Products** · **Orde
 ```
 NEXT_PUBLIC_SUPABASE_URL=
 NEXT_PUBLIC_SUPABASE_ANON_KEY=
-SUPABASE_SERVICE_ROLE_KEY=          # server-only (admin writes / seed)
+SUPABASE_SERVICE_ROLE_KEY=            # SERVER ONLY — never exposed to the frontend
 NEXT_PUBLIC_PAYMENT_LINK=https://pay.yoco.com/gees-convenience-store
-# Email provider (see open items) — e.g. RESEND_API_KEY=
+RESEND_API_KEY=                       # optional in dev (§10A); email falls back to dev transport
+EMAIL_FROM=GEES <no-reply@example.com>
+EMAIL_REPLY_TO=geesconveniencestore01@gmail.com
 ```
-Vercel: project linked to this GitHub repo; env vars set in Vercel. Supabase migrations applied via CLI.
+Vercel: project linked to this GitHub repo; env vars set in Vercel (Production/Preview/Development). Supabase migrations applied via CLI.
 
 ---
 
 ## 12. Migration / parity checklist
 
 - [ ] Repo scaffolded (Next.js + TS + Tailwind), no Base44 dependencies
-- [ ] `0001_init.sql` applied (tables, enums, RLS, triggers)
-- [ ] Seed: 25 products, 5 categories, 4 box themes, store settings (R100 / Yoco link)
-- [ ] 26 assets migrated to Supabase Storage / `public`; no `media.base44.com` references remain
+- [ ] `0001_init.sql` applied (tables, 3 enums, RLS, `profiles` trigger)
+- [ ] Source snapshot committed to `migration/source-snapshot/` (immutable)
+- [ ] DB + asset backups taken before migration (§6.3)
+- [ ] Seed: **25 products**, **5 categories**, **4 box themes**, store settings (R100 / Yoco link)
+- [ ] **26 assets** migrated; manifest with SHA-256; zero `media.base44.com` references
+- [ ] `verify-migration.ts` green (counts 25/5/4/26, asset HTTP 200, price parity)
+- [ ] Existing orders migrated **iff** owner export supplied (§6.2), history preserved
 - [ ] Design tokens + fonts match (palette, radius 0, Cormorant/Jost)
 - [ ] Routes: `/`, `/Shop`, `/product/:id`, `/BuildABox`, `/Account`, `/Admin`, auth pages, 404
-- [ ] Header (logo, nav, search, account, bag), announcement bar, footer
-- [ ] Home sections: hero, promise, categories, New In, experience, delivery, footer
+- [ ] Header (logo, nav, **search**, account, bag), announcement bar, footer
+- [ ] Home sections: hero, promise, categories, New In, experience, delivery, refund, footer
 - [ ] Shop filters (new/trending/category/sort) + counts
-- [ ] Product detail (stock states incl. out-of-stock)
+- [ ] Product detail (incl. out-of-stock)
 - [ ] Build A Box (sizes 5/10/15, 4 themes, qty, box line item)
 - [ ] Cart drawer 3 states; guest checkout + validation
 - [ ] Order creation + reference; Yoco redirect
 - [ ] Accounts: register/login/reset + order history
-- [ ] Admin: Overview/Products/Orders/Emails/Categories/Build a Box/Settings
-- [ ] Route-by-route visual comparison vs. reference (desktop + mobile)
+- [ ] Admin: Overview/Products/Orders/Emails/Categories/Build a Box/Settings (full CRUD + retry)
+- [ ] Email transport (§10A) with dev fallback; failure retry works
+- [ ] First admin promoted via `promote-admin.ts`; no credentials in code (§10B)
+- [ ] RLS + server-side authz verified (cross-customer reads blocked) (§10E)
+- [ ] No service-role key in any client bundle (§10D)
+- [ ] Social links hidden until real handles supplied (§10C)
+- [ ] Route-by-route visual comparison vs. reference at pixel level (desktop + mobile)
 
 ---
 
-## 13. Open items / risks (need decisions)
+## 13. Open items / remaining inputs
 
-1. **Transactional email** — Base44 sent order/status/welcome emails. Supabase doesn't. Need a provider (Resend/SMTP) + edge/server function, or mark as out-of-scope. Affects `EmailSetting`/`EmailLog`/Admin → Emails parity.
-2. **Admin user provisioning** — who is the first admin, and how the role is set.
-3. **`payment_status` enum values** — confirm exact options from Admin UI.
-4. **Search** — confirm scope (products search overlay in header).
-5. **Social links** — reference uses generic `instagram.com/`, `facebook.com/`, `tiktok.com/`; confirm real handles or keep placeholders.
-6. **Existing orders** — confirm whether any real orders exist in Base44 to migrate.
-7. **Category card visuals on Home** — no images found in the build; verify whether text-only cards are correct.
-8. **Fidelity target** — confirm pixel-parity expectation vs. structural parity.
+1. **Owner's Base44 order export** — needed to migrate real order history (§6.2). Until supplied, orders start empty.
+2. **Resend domain** — which sending domain (for `EMAIL_FROM`) once configured; dev works without it.
+3. **Real social handles** — until supplied, social links stay hidden (§10C).
+4. **Category cards on Home** — no images found in the build (VERIFIED); confirm text-only cards match the live site during the pixel-parity pass.
+5. **Supabase plan tier** — determines whether PITR vs. scheduled backups are available (§6.3).
 
 ---
 
 ## 14. Out of scope
 
-- Any change to the Base44 site (source of truth stays read-only).
-- Inventing products, prices, categories, copy, or business info.
-- Nothing from Base44's runtime/branding is carried into the new app.
+- Any change to the Base44 site (read-only source of truth).
+- Inventing products, prices, categories, copy, business info, or fake links.
+- Carrying any Base44 runtime/branding into the new app.
