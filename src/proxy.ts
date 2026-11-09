@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { updateSession } from "@/lib/supabase/proxy";
+import { updateSession } from "@/lib/supabase/session";
 
 /**
  * Next.js 16 Proxy (formerly middleware).
