@@ -1,11 +1,30 @@
-# Stage 3 — Supabase schema, RLS & migration plan (REVISED v2, FOR REVIEW)
+# Stage 3 — Supabase schema, RLS & migration plan (FINAL v3, FOR REVIEW)
 
 Status: **proposed — not applied.** No database objects created. No credentials used or committed. Base44 site untouched.
-Supersedes v1. Awaiting explicit approval before implementation.
+Supersedes v1 and v2. Awaiting explicit approval before implementation.
+v2 architecture approved in principle; v3 applies the eleven final amendments and adds a security test checklist (§15).
 
 ---
 
-## 0. What changed in v2 (mapped to your review points)
+## 0a. What changed in v3 (mapped to your final checks)
+
+| # | Your requirement | v3 response |
+|---|---|---|
+| 1 | `SECURITY DEFINER` hardening | ✅ Explicit `REVOKE ALL … FROM PUBLIC`, grants only to intended roles, pinned `search_path`, schema-qualified references (§6.3, §12.1). |
+| 2 | Guest retrieval returns only customer-facing data | ✅ `get_order_by_token()` now builds an explicit **field whitelist** (no `id`, no `user_id`, no admin notes, no payment internals) (§7). |
+| 3 | Transactional stock reservation | ✅ New `stock_reservations` table + atomic reservation inside `create_order()`, with `expires_at` and `release_expired_reservations()` (§6.2). |
+| 4 | Preserve Build-a-Box rules | ✅ 5/10/15 packs, individual prices, eligibility rules and existing theme/category links preserved verbatim (§6.1, §9). |
+| 5 | Preserve R100 delivery; no free-delivery threshold | ✅ Fee read from `store_settings` (default **R100**); the free-delivery threshold idea is **withdrawn** (§4.6, §6.1). |
+| 6 | Do not guess order-reference sequence | ✅ No speculative default; sequence is seeded **only** from verified records/source; checkout blocked until confirmed (§9). |
+| 7 | Email copy export or empty | ✅ Unchanged: seed verbatim if exported, else `''` (reference fallback) (§10). |
+| 8 | Category delete → warning + reassign | ✅ `ON DELETE SET NULL` kept; admin confirm-warning + `reassign_products_category()` RPC (§4.3, §6.4). |
+| 9 | Only verified payment outcomes change status | ✅ Reaffirmed; redirects never establish success (§8). |
+| 10 | Confirm tier before upgrade | ✅ Unchanged: tier confirmation required first (§14). |
+| 11 | Versioned CLI migrations + separate rollbacks | ✅ Unchanged; rollback files extended for the new table (§13). |
+
+---
+
+## 0. What changed in v2 (mapped to your earlier review points)
 
 | # | Your requirement | v2 response |
 |---|---|---|
@@ -66,6 +85,7 @@ No credentials locally (env unset, no `.env.local`, CLI not linked), so I could 
 | `email_type` | `order_confirmation`, `payment_confirmation`, `status_received`, `status_processing`, `status_dispatched`, `status_delivered`, `status_cancelled`, `welcome` |
 | `user_role` | `customer`, `admin` |
 | `email_log_status` | `sent`, `failed`, `skipped` |
+| `reservation_status` | `held`, `committed`, `released`, `expired` *(new in v3 — internal only)* |
 
 ---
 
@@ -84,7 +104,9 @@ No credentials locally (env unset, no `.env.local`, CLI not linked), so I could 
 Behaviour: `ON UPDATE CASCADE` (renaming a slug propagates — matches the app's `CA`-normalised lookups) and `ON DELETE SET NULL` (deleting a category never destroys products; they become uncategorised, which is what the reference tolerates). *Alternative considered:* `ON DELETE RESTRICT` — rejected because it would block the admin Categories tab, changing existing behaviour.
 Effective price = `COALESCE(sale_price, price)` — matches the reference's strikethrough display.
 
-### 4.4 `box_themes` + `box_theme_categories` (point 1)
+**Category deletion UX (point 8):** The Admin Categories tab must (a) show a confirmation warning naming the affected product count before deleting, and (b) offer reassignment first via `reassign_products_category(old_slug, new_slug)` (§6.4). The `SET NULL` FK is the safety net; the warning + reassign path is the intended workflow so no product is silently orphaned.
+
+### 4.4 `box_themes` + `box_theme_categories` (point 4)
 `box_themes`: `id uuid PK` · `name text NOT NULL` · `description text NOT NULL DEFAULT ''` · **`active bool NOT NULL DEFAULT true`** · `sort_order int NOT NULL DEFAULT 0` · timestamps.
 
 `box_theme_categories`: `box_theme_id uuid FK → box_themes(id) ON DELETE CASCADE` · `category_slug text FK → categories(slug) ON UPDATE CASCADE ON DELETE CASCADE` · `PRIMARY KEY (box_theme_id, category_slug)`.
@@ -107,8 +129,15 @@ All defaults verbatim from `wz` (§1). The `social_*` columns are an **additive 
 ### 4.7 `email_settings`
 `id uuid PK` · `type email_type NOT NULL UNIQUE` · `subject text NOT NULL DEFAULT ''` · `html text NOT NULL DEFAULT ''` · `enabled bool NOT NULL DEFAULT true` · `updated_at`.
 
-### 4.8 `email_logs` (point 5)
+### 4.8 `email_logs` (order link)
 `id uuid PK` · **`order_id uuid NULL → orders(id) ON DELETE SET NULL`** (authoritative link; `NULL` for non-order mail such as `welcome`) · `order_reference text NULL` (display snapshot, survives order deletion) · `type email_type NOT NULL` · `to_email text NOT NULL` · `status email_log_status NOT NULL` · `error text NULL` · `attempts int NOT NULL DEFAULT 0` · `created_at`.
+
+### 4.9 `stock_reservations` (v3, point 3)
+Holds stock for an unpaid order so concurrent checkouts cannot oversell.
+`id uuid PK` · `order_id uuid NOT NULL → orders(id) ON DELETE CASCADE` · `product_id uuid NOT NULL → products(id) ON DELETE RESTRICT` · `quantity int NOT NULL CHECK (> 0)` · `status reservation_status NOT NULL DEFAULT 'held'` (`held` | `committed` | `released` | `expired`) · `expires_at timestamptz NOT NULL` (default `now() + interval '30 minutes'`) · `created_at`.
+Indexes: `(product_id)`, `(status, expires_at)`, `(order_id)`. Only `held` rows count against availability; `released`/`expired` rows are history.
+
+**Availability rule (single source of truth):** `available(p) = p.stock − Σ(quantity of held, non-expired reservations for p)`. This is the only place stock is counted, so the storefront, Build-a-Box pool and checkout all agree.
 
 ---
 
@@ -120,97 +149,167 @@ auth.users 1─* orders                      (user_id NULL = guest)
 categories 1─* products                    (products.category_slug → categories.slug, UNIQUE)
 box_themes *─* categories                  (via box_theme_categories)
 orders 1─* email_logs                      (email_logs.order_id, NULL for welcome)
+orders 1─* stock_reservations              (CASCADE; products 1─* stock_reservations, RESTRICT)
 store_settings (single row)   ·   email_settings (one row per email_type)
 ```
 
 ---
 
-## 6. Server-side order creation & validation (point 3)
+## 6. Server-side order creation, validation & stock (points 3, 5)
 
-**No client `INSERT` on `orders`.** The policy is revoked for `anon`/`authenticated`; the only path is:
+### 6.1 Validation & pricing
+**No client `INSERT` on `orders`.** The policy is revoked for `anon`/`authenticated`; the only path is the `create_order()` RPC:
 
 ```sql
 create function public.create_order(payload jsonb) returns jsonb
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare v_fee numeric; v_sub numeric(10,2) := 0; it jsonb; v_line jsonb; ...
 begin
-  select delivery_fee into v_fee from store_settings where id = 1;   -- fee: server-side only
+  -- Fee: server-side only. R100 standard charge from store settings; NO free-delivery threshold.
+  select public.store_settings.delivery_fee into v_fee from public.store_settings where id = 1;
 
   for it in select * from jsonb_array_elements(payload->'items') loop
-    v_line := public.resolve_line(it);      -- looks up products by id
+    v_line := public.resolve_line(it);      -- looks up public.products by id
     v_sub  := v_sub + (v_line->>'line_total')::numeric;   -- prices from DB, NOT the client
   end loop;
 
-  insert into orders (
-    order_reference,
-    user_id,                                -- = auth.uid() when signed in, else NULL
-    customer_name, customer_email, phone, address, city, province, postal_code, gift_note,
-    items, subtotal, delivery_fee, total,
-    status, payment_status                  -- forced
-  ) values (
-    public.next_order_reference(),
-    auth.uid(),
-    payload->>'customer_name', payload->>'customer_email', ...,
-    v_sub, v_fee, v_sub + v_fee,
-    'pending_payment', 'unpaid'
-  ) returning id, order_reference, public_token, total into ...;
+  insert into public.orders ( ... , status, payment_status )   -- forced literals
+  values ( public.next_order_reference(), auth.uid(), ..., v_sub, v_fee, v_sub + v_fee,
+           'pending_payment', 'unpaid' )
+  returning id, order_reference, public_token, total into ...;
 
   return jsonb_build_object('order_reference', ..., 'public_token', ..., 'total', ...);
 end $$;
 ```
 
 Guarantees:
-- **Prices/subtotal** come from `products` (`COALESCE(sale_price, price)`) — client-supplied prices are ignored.
-- **Delivery fee** comes from `store_settings` — not client-supplied.
+- **Prices/subtotal** come from `public.products` (`COALESCE(sale_price, price)`) — client-supplied prices are ignored.
+- **Delivery fee** comes from `public.store_settings` (default **R100**) — not client-supplied, and **no free-delivery threshold** is introduced (point 5).
 - **Total** = `subtotal + delivery_fee`, computed in the function.
 - **Ownership**: `user_id` is set from `auth.uid()` only; the client cannot choose it.
 - **Payment state**: `status`/`payment_status` are literals inside the function; unreachable from the client.
-- `revoke all on function public.create_order(jsonb) from public; grant execute … to anon, authenticated;`
 
-**Open dependency:** Build-a-Box line pricing (pack sizes **5 / 10 / 15**) and any free-delivery threshold must be confirmed from the reference before the checkout stage; `resolve_line` will encapsulate that rule. Until then it handles normal items only. See §16.
+**Build-a-Box preservation (point 4):** `resolve_line` keeps the existing **5 / 10 / 15** pack sizes, prices each line from the **individual product price**, and applies the existing eligibility rules (`box_eligible !== false AND visible !== false`, theme filtered to its categories). Pack sizes are counts, not fixed bundle prices — no bundle price is invented. Theme/category assignments are the existing links in `box_theme_categories` (§4.4).
+
+### 6.2 Transactional stock reservation (point 3)
+All reservation happens **inside the same `create_order()` transaction**, so a failure rolls the whole order back:
+
+```sql
+-- inside create_order(), per line, after resolving the product:
+select p.stock - coalesce(sum(r.quantity) filter (where r.status='held' and r.expires_at > now()), 0)
+  into v_avail
+  from public.products p
+  left join public.stock_reservations r on r.product_id = p.id
+  where p.id = v_line_product_id
+  for update of p;                       -- row lock: serialises concurrent buyers
+
+if v_avail < v_qty then
+  raise exception 'insufficient_stock:%', v_line_product_id using errcode = 'P0001';
+end if;
+
+insert into public.stock_reservations (order_id, product_id, quantity, status, expires_at)
+values (v_order_id, v_line_product_id, v_qty, 'held', now() + interval '30 minutes');
+```
+
+Lifecycle:
+- **Held** — created on order creation; counts against `available(p)` (§4.9).
+- **Committed** — set when payment is independently verified (§8); this is when `products.stock` is decremented (pending confirmation that the reference decrements on order — see §16).
+- **Expired** — `release_expired_reservations()` flips `held` rows past `expires_at` to `expired`, returning the units to availability. It is `SECURITY DEFINER`, granted to `authenticated`, and also invoked opportunistically at checkout start; an optional `pg_cron` schedule can run it periodically (out of scope for Stage 3 — no extension enabled without approval).
+- **Released** — an admin cancelling an unpaid order (§8) releases its `held` rows immediately.
+
+This prevents overselling under concurrency: availability is always `stock − held`, guarded by a row lock.
+
+### 6.3 `SECURITY DEFINER` hardening (point 1)
+Every `SECURITY DEFINER` function (`create_order`, `get_order_by_token`, `next_order_reference`, `release_expired_reservations`, `reassign_products_category`, `is_admin`) follows these rules:
+
+1. **Revoke the implicit PUBLIC grant** first: `revoke all on function public.<fn>(<args>) from public;`
+2. **Grant only to intended roles** — least privilege:
+   - `create_order(jsonb)`, `get_order_by_token(uuid)` → `grant execute … to anon, authenticated;`
+   - `release_expired_reservations()` → `grant execute … to authenticated;` (body is idempotent; no admin check needed)
+   - `reassign_products_category(text, text)` → `grant execute … to authenticated;` with an **internal `is_admin()` check** (never granted to `anon`)
+   - `is_admin()` → `grant execute … to authenticated;`
+3. **Pin the search path**: `set search_path = public, pg_temp` (no `$user`, no writable schemas).
+4. **Schema-qualify every reference** in the body (`public.products`, `public.store_settings`, `public.orders`, `public.is_admin()`, …) so a hostile `search_path` cannot redirect them.
+5. Functions are **owned by the migration role** (not `anon`/`authenticated`), so the definer privileges are not user-controllable.
+
+### 6.4 Category reassignment (point 8)
+```sql
+create function public.reassign_products_category(p_old text, p_new text) returns int
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if not public.is_admin() then raise exception 'forbidden' using errcode = '42501'; end if;
+  update public.products set category_slug = p_new where category_slug = p_old;
+  update public.box_theme_categories set category_slug = p_new where category_slug = p_old
+    on conflict do nothing;
+  return (select count(*) from public.products where category_slug = p_new);
+end $$;
+```
+The Admin Categories tab calls this before deletion, after showing the affected-product warning (§4.3). `ON DELETE SET NULL` remains the fallback if an admin deletes without reassigning.
+
+**Open dependency (unchanged):** whether the reference decrements `products.stock` on order vs only on verified payment must be confirmed before checkout (§16). Reservation logic above is designed to support either; activation matches the reference.
 
 ---
 
-## 7. Guest confirmation & retrieval (point 4)
+## 7. Guest confirmation & retrieval (points 2, 4)
 
 - Every order gets a random `public_token` (122-bit UUID). `order_reference` stays as the human/payment-matching reference only.
-- **Creation response** returns `order_reference`, `public_token`, `total` → the confirmation screen renders from this; no `SELECT` needed.
-- **Later retrieval** (e.g. reopening the confirmation link) uses:
-  ```sql
-  create function public.get_order_by_token(p_token uuid) returns jsonb
-  language sql stable security definer set search_path = public as $$
-    select to_jsonb(o) - 'user_id' from orders o where o.public_token = p_token;
-  $$;
-  ```
-  `security definer` + token match only; returns a **whitelisted** projection (no `user_id`, no other customers' rows). Tokens are not enumerable.
-- Signed-in customers additionally have the RLS `SELECT` (owner-or-admin) path.
+- **Creation response** returns only `order_reference`, `public_token`, `total` → the confirmation screen renders from this; no `SELECT` needed.
+- **Later retrieval** (e.g. reopening the confirmation link) uses `get_order_by_token()`, which returns an **explicit field whitelist** — never `to_jsonb(o) - 'user_id'`, because subtraction still leaks `id` and any future column:
+
+```sql
+create function public.get_order_by_token(p_token uuid) returns jsonb
+language sql stable security definer set search_path = public, pg_temp as $$
+  select jsonb_build_object(
+           'order_reference', o.order_reference,
+           'customer_name',   o.customer_name,
+           'items',           o.items,
+           'subtotal',        o.subtotal,
+           'delivery_fee',    o.delivery_fee,
+           'total',           o.total,
+           'status',          o.status,          -- progress only
+           'payment_status',  o.payment_status,  -- 'unpaid'|'paid'|'failed', never amounts/gateway data
+           'created_at',      o.created_at
+         )
+  from public.orders o
+  where o.public_token = p_token;
+$$;
+revoke all on function public.get_order_by_token(uuid) from public;
+grant execute on function public.get_order_by_token(uuid) to anon, authenticated;
+```
+
+**Never exposed (point 2):** internal `id`, `user_id`, `public_token` (echo only, never re-queryable beyond the holder), admin notes, `paid_at`/gateway references, `next_order_reference()` internals or any other customer's row. `security definer` + exact token match; tokens are 122-bit and non-enumerable.
+- Signed-in customers additionally have the RLS `SELECT` (owner-or-admin) path, which also excludes admin-only columns.
 
 ---
 
-## 8. Payments (point 7)
+## 8. Payments (point 9)
 
 - `payment_status` starts `unpaid` and is **never** settable by the client (no INSERT policy; not a parameter of `create_order`).
-- The Yoco redirect/return is treated as **informational only** — it does not set `paid`. The return page may *show* "awaiting payment confirmation".
-- `paid` is only ever written server-side by the service-role client: by an admin action (Admin → Orders) and, in future, by a Yoco webhook/verification call. `paid_at` records when verification happened.
-- `failed` remains available for a rejected/failed payment recorded server-side.
+- The Yoco redirect/return is **informational only** — it does **not** set `paid` and is never treated as proof of payment. The return page may *show* "awaiting payment confirmation".
+- **Only independently verified outcomes change payment status**: an admin marking the order paid after checking the gateway, or (later) a server-side Yoco verification/webhook call. `paid_at` records when verification happened.
+- On verified `paid`: `settle_order(order_id, outcome)` is called server-side — it sets `payment_status='paid'`, commits the order's `held` reservations to `committed`, and decrements `products.stock` (pending reference confirmation, §16).
+- On `failed` (recorded server-side only): `held` reservations are released.
+- Admin cancelling an unpaid order calls `release_expired_reservations()`-equivalent release for that order, returning stock.
 
 ---
 
-## 9. Order references (point 8)
+## 9. Order references (point 6)
 
 **Confirmed:** `order_reference` is produced by a Base44 **backend function**; the client receives it read-only. The rule is not present in the public bundle, and no literal `gees<number>` exists in it.
 
-**Proposed reproduction of the observed format** (`gees1007`, `gees1008` = prefix `gees` + a 4-digit sequential number):
+**Reproduction of the observed format** (`gees1007`, `gees1008` = prefix `gees` + a sequential number):
 - A dedicated Postgres sequence `order_reference_seq`; `next_order_reference()` = `'gees' || nextval('order_reference_seq')`.
-- Sequence initialised to `max(numeric suffix of existing references) + 1`, i.e. continuing the live series; default **1001** if the table is empty.
-- A sequence (not `count+1`) guarantees uniqueness under concurrent checkout.
-- Uniqueness enforced by `UNIQUE(order_reference)`.
+- Uniqueness enforced by `UNIQUE(order_reference)`; a sequence (not `count+1`) guarantees this under concurrent checkout.
 
-**Still to confirm before checkout development (see §16):** the exact starting number and step. Please supply either a few real references (e.g. the gees1007/1008 values seen in production) **or** the Base44 backend function source, so the sequence can be seeded identically. I will not invent a starting point.
+**No guessed starting number (point 6).** The sequence is seeded **only** from verified order records or the backend source:
+- If the `Order` table (or an owner export) is available: seed to `max(numeric suffix) + 1`, continuing the live series exactly.
+- If it is **not** available: the sequence is **not** seeded with any speculative value (the earlier "default 1001" is **withdrawn**), and **checkout cannot be enabled** until the rule is confirmed. I will not invent a starting point.
+
+**Blocking input for checkout (see §16):** provide either a few real production references **or** the Base44 backend function source. Until then, `orders.order_reference` stays `NOT NULL UNIQUE` but the sequence is left unseeded and checkout is off.
 
 ---
 
-## 10. Email templates & logs (point 9)
+## 10. Email templates & logs (point 7)
 
 **Confirmed:** the reference's template copy is stored in the `EmailSetting` table (`subject`, `html`) and rendered by a backend function; the public table is **empty (0 rows)**, and no default copy exists in the client bundle.
 
@@ -221,7 +320,7 @@ Therefore:
 
 ---
 
-## 11. Admin security (point 6)
+## 11. Admin security (role escalation guards)
 
 - **`role` is never derived from user-editable data.** `auth.users.raw_user_meta_data` is user-writable, so `handle_new_user()` hardcodes `role = 'customer'` and only copies `full_name` (a display value) from metadata.
 - `profiles` has **no client `INSERT`/`DELETE`** policy; rows are created solely by the signup trigger (`ON CONFLICT (id) DO NOTHING`).
@@ -243,40 +342,43 @@ RLS enabled on **every** table; default deny. The service role bypasses RLS (ser
 | `box_themes` | ✅ true | ✅ true | admin | admin | admin |
 | `box_theme_categories` | ✅ true | ✅ true | admin | admin | admin |
 | `store_settings` | ✅ true | ✅ true | admin | admin | admin |
-| `orders` | ❌ | ✅ `customer_email = auth.jwt()->>'email' OR is_admin()` | **❌ (revoked — only `create_order`)** | admin | admin |
+| `orders` | ❌ | ✅ `user_id = auth.uid() OR customer_email = auth.jwt()->>'email' OR is_admin()` | **❌ (revoked — only `create_order`)** | admin | admin |
+| `stock_reservations` | ❌ | ✅ `is_admin()` | **❌ (only via `create_order` / release fn)** | **❌ (server/definer only)** | admin |
 | `profiles` | ❌ | ✅ `id = auth.uid() OR is_admin()` | ❌ | ✅ `id = auth.uid()` + role trigger | ❌ |
 | `email_settings` | ❌ | admin | admin | admin | admin |
 | `email_logs` | ❌ | admin | ❌ (server writes) | admin | admin |
 
-Function grants: `create_order` and `get_order_by_token` → `EXECUTE` to `anon, authenticated`; all `SECURITY DEFINER` functions pinned with `set search_path`.
+### 12.1 Function grants & `SECURITY DEFINER` hardening
+- `create_order(jsonb)`, `get_order_by_token(uuid)` → `EXECUTE` to `anon, authenticated`; `release_expired_reservations()`, `reassign_products_category(text,text)`, `is_admin()` → `authenticated` (+ internal admin check where required).
+- Every `SECURITY DEFINER` function first `REVOKE ALL … FROM PUBLIC`, pins `set search_path = public, pg_temp`, and schema-qualifies all references — full rules in **§6.3**.
 
 ---
 
-## 13. Migration sequence (point 10)
+## 13. Migration sequence (point 11)
 
 Versioned Supabase CLI migrations under `supabase/migrations/`, each with a **separate, independently reviewed** rollback under `supabase/rollback/`.
 
 | Ver | Migration | Rollback (separate file, reviewed) |
 |---|---|---|
 | 0000 | extensions + `set_updated_at()` + `is_admin()` | drop functions |
-| 0001 | 5 enum types | drop enum types |
+| 0001 | enum types (incl. `reservation_status`) | drop enum types |
 | 0002 | `profiles` + `handle_new_user()` + `prevent_role_escalation()` + triggers | drop triggers/functions + table |
 | 0003 | `categories` (+ unique slug) + RLS | drop table |
 | 0004 | `box_themes` + `box_theme_categories` + RLS | drop tables (child first) |
 | 0005 | `products` + FK + indexes + RLS | drop table |
-| 0006 | `orders` + `public_token` + `order_reference_seq` + `next_order_reference()` + RLS | drop table/sequence/functions |
+| 0006 | `orders` + `public_token` + `order_reference_seq` + `next_order_reference()` + `stock_reservations` + RLS | drop table/sequence/functions |
 | 0007 | `store_settings` + RLS | drop table |
 | 0008 | `email_settings` + `email_logs` (+ `order_id` FK) + RLS | drop tables |
-| 0009 | `create_order()` + `get_order_by_token()` + grants | drop functions |
+| 0009 | `create_order()`, `get_order_by_token()`, `settle_order()`, `release_expired_reservations()`, `reassign_products_category()` + grants/hardening | drop functions |
 | 0010 | seed: 5 categories, 4 box themes, 4 theme-category links, 25 products | delete seeded rows |
 | 0011 | seed: `store_settings` singleton (+ null social columns) | delete row |
 | 0012 | seed: `email_settings` rows (empty copy pending owner export) | delete rows |
 
-Applied via `supabase db push` / `migration up`. Rollbacks are executed explicitly by filename — never as inline comments. Storage buckets (`product-images`, `brand`) remain **out of Stage 3**.
+Applied via `supabase db push` / `migration up`. Rollbacks are executed explicitly by filename — never as inline comments. `order_reference_seq` seeding is a **separate, gated** step (checkout stays disabled until §9 is confirmed). Storage buckets (`product-images`, `brand`) remain **out of Stage 3**.
 
 ---
 
-## 14. Backup options — document before recommending an upgrade (point 11)
+## 14. Backup options — document before recommending an upgrade (point 10)
 
 Supabase's backup features depend on plan tier (verify against Supabase's current pricing/docs, as these change):
 
@@ -292,23 +394,71 @@ Supabase's backup features depend on plan tier (verify against Supabase's curren
 3. Immutable Base44 source snapshot (products/categories/themes) committed under `migration/source-snapshot/` → seed data is reproducible.
 4. `.env.local`/Vercel env values kept in the owner's password manager.
 
-**Please confirm** your current tier (Free or Pro) so I can state the exact automated-backup position; an upgrade is only worth discussing if you want automated daily backups or PITR.
+**Please confirm** your current tier (Free or Pro) so I can state the exact automated-backup position (**point 10**). **No upgrade is recommended** until the actual tier is confirmed; an upgrade is only worth discussing afterwards and only if you want automated daily backups or PITR.
 
 ---
 
-## 15. Verification (after applying)
+## 15. Security test checklist (run after applying; `scripts/verify-schema.ts`)
 
-`scripts/verify-schema.ts`: 9 tables exist with RLS enabled; 5 enums with exact values; expected policy set; seed counts (`categories=5`, `box_themes=4`, `box_theme_categories=7` links across the 4 themes, `products=25`, `store_settings=1`); **negative tests with the anon key**: cannot `INSERT` an order directly, cannot set `status='paid'`, cannot change own `profiles.role`, cannot read another email's orders; `create_order` ignores client-supplied prices (totals recomputed); duplicate `order_reference` rejected; no `media.base44.com` strings in rows.
+**A. Schema integrity**
+- [ ] All 10 tables exist with **RLS enabled** (`relrowsecurity = true`).
+- [ ] Enums present with exact values, incl. `reservation_status` and `email_log_status`.
+- [ ] Seed counts: `categories=5`, `box_themes=4`, `box_theme_categories=7` links, `products=25`, `store_settings=1`.
+- [ ] No `media.base44.com` strings remain in any row.
+
+**B. Authorization / RLS (negative tests with the anon + a customer key)**
+- [ ] anon/customer **cannot `INSERT`** into `orders` directly → denied.
+- [ ] customer **cannot** set `status='paid'` / `payment_status='paid'` on their own order → denied.
+- [ ] customer **cannot** `UPDATE` another user's `orders` → denied.
+- [ ] customer **cannot** read another email's orders via the `orders` SELECT policy → 0 rows.
+- [ ] customer **cannot** change `profiles.role` (self-promote) → `prevent_role_escalation` raises.
+- [ ] customer **cannot** change `role` via `raw_user_meta_data` on signup → row is always `customer`.
+- [ ] customer **cannot `INSERT`/`DELETE`** `profiles` → denied.
+- [ ] anon/customer **cannot** read `email_settings` / `email_logs` / `stock_reservations` → denied.
+- [ ] anon/customer **cannot** `INSERT`/`UPDATE` `stock_reservations` directly → denied.
+- [ ] non-admin **cannot** execute `reassign_products_category()` → `forbidden`.
+
+**C. `SECURITY DEFINER` hardening**
+- [ ] `has_function_privilege('anon', <fn>, 'EXECUTE')` is true only for `create_order`, `get_order_by_token` (not for admin-only fns).
+- [ ] `pg_proc.proacl` shows **no `=X` PUBLIC grant** on any definer function.
+- [ ] each definer function has `search_path = public, pg_temp` (checked via `proconfig`).
+- [ ] functions are owned by the migration role, not `anon`/`authenticated`.
+
+**D. Order integrity**
+- [ ] `create_order` **ignores client-supplied prices** — send a tampered price, assert DB total is recomputed from `products`.
+- [ ] delivery fee equals `store_settings.delivery_fee` (**R100** default); client override ignored; no free-delivery branch.
+- [ ] `user_id` is set from `auth.uid()` (signed-in) / `NULL` (guest); client-supplied `user_id` ignored.
+- [ ] new order is always `status='pending_payment'`, `payment_status='unpaid'`.
+- [ ] duplicate `order_reference` is rejected by the UNIQUE constraint.
+- [ ] Build-a-Box lines keep **5/10/15** pack sizes and use **individual product prices** (no invented bundle price).
+
+**E. Guest retrieval**
+- [ ] `get_order_by_token` returns **only** the whitelisted fields (assert `id`, `user_id`, `paid_at` are absent).
+- [ ] wrong/absent token → returns nothing (no row leak); tokens are non-enumerable.
+
+**F. Stock reservation**
+- [ ] two concurrent `create_order` for the last unit → exactly one succeeds, the other raises `insufficient_stock` (row-lock proven).
+- [ ] `release_expired_reservations()` flips past-`expires_at` `held` rows to `expired` and restores availability.
+- [ ] cancelling an unpaid order releases its held stock.
+- [ ] on verified `paid`, held rows → `committed` and `products.stock` decremented.
+
+**G. Payments**
+- [ ] a browser redirect / return-page call **cannot** change `payment_status` (assert still `unpaid`).
+- [ ] only a service-role/admin verified action can set `paid`; `paid_at` recorded then.
+
+**H. Migrations**
+- [ ] each migration has a matching `supabase/rollback/NNNN_*.sql`; applying the rollback restores the prior state on a scratch DB.
+- [ ] `order_reference_seq` is **unseeded** until §9 is confirmed; checkout remains disabled.
 
 ---
 
 ## 16. Decisions / inputs needed before implementation
 
-1. **Build-a-Box pricing rule** (pack sizes 5/10/15) and any free-delivery threshold — required for `resolve_line`.
-2. **Order-reference samples or backend function source** — to seed the sequence identically (§9).
-3. **`EmailSetting` export** (or the backend's default copy) — to preserve template copy verbatim (§10).
-4. **Category delete behaviour** — proposed `ON DELETE SET NULL`; confirm or choose `RESTRICT`.
+1. **Build-a-Box pricing rule** — pack sizes **5/10/15** and **individual product prices** are preserved; still to confirm whether the reference applies **any** pack discount (if not, pack total = sum of individual prices).
+2. **Order-reference samples or backend function source** — **blocking**; the sequence is not seeded (and checkout stays off) until verified (§9). No guessed number.
+3. **`EmailSetting` export** (or the backend's default copy) — to preserve template copy verbatim; otherwise templates stay empty (§10).
+4. **Stock decrement timing** — confirm whether the reference decrements `products.stock` at order creation or only on verified payment, so reservation-commit timing matches (§6.2, §8). *(Ratified: `ON DELETE SET NULL` for categories, with an admin warning + reassign path — no longer open.)*
 5. **`payment_status='failed'`** — confirm it is ever used, and by what (nothing in the current flow sets it).
-6. **Stock decrement on order** — does the reference reduce `products.stock` when an order is placed? (Not observed in the bundle.)
-7. **Supabase tier** (Free/Pro) for the backup statement (§14).
+6. **Payment verification method** — confirm the Yoco verification route (manual admin check vs a server-side verification/webhook) that will authorise `paid`.
+7. **Supabase tier** (Free/Pro) — required before any backup recommendation (§14).
 8. **Apply method** — CLI migrations (preferred, versioned) vs dashboard SQL.
