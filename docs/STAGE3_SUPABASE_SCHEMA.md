@@ -1,8 +1,22 @@
-# Stage 3 — Supabase schema, RLS & migration plan (FINAL v7 — CSRF DELIVERY + OWNER-SCOPED IDEMPOTENCY, FOR APPROVAL)
+# Stage 3 — Supabase schema, RLS & migration plan (FINAL v8 — GRACE-COOKIE REVIEW, FOR APPROVAL)
 
 Status: **proposed — not applied.** No database objects created. No credentials used or committed. Base44 site untouched.
-Supersedes v1–v6. Awaiting **separate explicit approval** before implementation.
-v6 closed the guest-session boundary (§24); v7 fixes CSRF token delivery without exposing the HttpOnly guest cookie, and removes owner-independent deduplication in favour of owner/key identity preserved across renewal (§24.2, §24.4).
+Supersedes v1–v7. Awaiting **separate explicit approval** before implementation.
+v7 fixed CSRF delivery and removed owner-independent dedupe; v8 reviews the grace-cookie design (§24.7), corrects the idempotency resolution order across invalidation, and states clearly that **no test has been executed** (all tests are specified only).
+
+---
+
+## 0f. What changed in v8 (grace-cookie review)
+
+| # | Your verification | v8 response |
+|---|---|---|
+| 1 | Signed, time-limited, validated server-side | ✅ Same HMAC + `exp`-in-payload format; timing-safe compare + `iat ≤ now < exp` on every use (§24.7). |
+| 2 | Preserves only the idempotency owner; no order access | ✅ Content is a prior `sid` only; consulted **only** in the checkout-create idempotency lookup; never on any read path (§24.7). |
+| 3 | Cannot be used by another guest to impersonate | ✅ HttpOnly + signed; only the original browser holds it; single-purpose scope grants no read/admin access (§24.7). |
+| 4 | Not replayable beyond expiry | ✅ `exp` inside the signed bytes; expired/tampered cookies rejected (§24.7). |
+| 5 | Does not bypass CSRF/Origin/method checks | ✅ Those checks run identically and **before** grace evaluation; grace never applies to GET (§24.7). |
+| 6 | No duplicate orders / no cross-exposure | ✅ **Corrected resolution order**: after invalidation the browser has the new `sid`, so the lookup must check the key under the current owner **and** the grace (previous) owner — v7's "current → else grace" ordering would have missed the original order (§24.4 pt 2). |
+| — | Executed vs specified tests | ✅ §24.7 states plainly: **nothing has been executed**; all §15/§24.6 tests are specified only. |
 
 ---
 
@@ -737,7 +751,8 @@ Each rollback file states its **preconditions** (dependent objects already remov
 - [ ] RLS enabled on all **11** tables; policies per §12; column-level + sequence revokes per §20
 - [ ] **Gated:** `order_reference_seq` seeding left undone; **checkout disabled** (B2)
 
-**Verification (on a scratch project, §15/§21)**
+**Verification (on a scratch project, §15/§21) — ⚠ all items below are SPECIFIED, NOT YET EXECUTED**
+> No database, route or cookie code exists yet, so none of these have been run. They execute during Stage 3 implementation; pass/fail will be reported then.
 - [ ] `scripts/verify-schema.ts` passes checklist **A / C / H**
 - [ ] anon/customer negative RLS tests pass (**B**)
 - [ ] price-tampering + idempotency (scoped key, payload-hash rejection) tests pass (**D**, §17.1)
@@ -804,7 +819,7 @@ Two distinct operations, deliberately separated:
 Because a new `sid` changes the owner, a post-invalidation retry with the same key must not become a second order. The mechanism is **owner preservation**, never payload/email similarity:
 
 1. **Renewal keeps the owner.** The common case — extending the session — keeps the **same `sid`**, so `(idempotency_owner, idempotency_key)` is unchanged and a retry returns the **same** order. This is the default and needs no grace.
-2. **Controlled invalidation keeps the owner via a signed grace cookie.** When a new `sid` is issued (sign-in, logout, abuse), the server also sets a short-lived, signed **grace cookie** carrying the **previous** owner. The Route Handler resolves the owner in order: current `sid` → else grace cookie. So a retry that started before invalidation still maps to the original owner and returns the original order, until the grace cookie expires.
+2. **Controlled invalidation keeps the owner via a signed grace cookie.** When a new `sid` is issued (sign-in, logout, abuse), the server also sets a short-lived, signed **grace cookie** containing the **previous `sid` in the same signed format** (owner = `hash(prev_sid)`, nothing else). The idempotency lookup checks the key under the **current owner *and*, if a valid grace cookie is present, the previous owner** — taking whichever already holds that `(owner, key)`. This is required because after invalidation the browser presents the *new* `sid`, so a retry would otherwise resolve to the new owner and miss the original order. The grace cookie is therefore **secondary and additive**: it never overrides the current owner, it only supplies the prior owner for the idempotency conflict lookup. It carries **no order data** and is **never** accepted on any read path (§24.7).
 3. **Identity, not similarity.** There is **no** owner-independent dedupe on `(customer_email, payload_hash, …)`. Two different sessions (different owners) with the *same* email and an *identical* basket therefore produce **two separate orders** — correct behaviour. `idempotency_payload_hash` is retained **only** to detect misuse of one key by one owner (`same owner + same key + different payload → reject`, §17.1); it is never used to collapse orders across owners.
 4. **After the grace window.** Once the grace cookie has expired, a resubmission is a genuinely new session and creates a new order — the client is expected to retain its `idempotency_key` per attempt and to disable resubmission while a request is in flight, so this case is a last resort, not the happy path.
 
@@ -835,3 +850,25 @@ Files: existing [server.ts](file:///workspace/src/lib/supabase/server.ts) (signe
 - [ ] **HMAC tamper** — flip a byte of the cookie payload, or change `exp` → assert the server rejects and reissues.
 - [ ] **Expired cookie replay** — present a validly-signed cookie whose `exp` is in the past → assert rejection (`exp` is inside the signed payload).
 - [ ] **Claim check** — confirm no function references the deprecated `auth.role()` (grep the migration SQL).
+
+### 24.7 Grace-cookie design review (v8)
+**What it is:** a second, HttpOnly cookie `gees_guest_prev` holding the **previous `sid` in the identical signed format** as §24.1 (`payload.sig`, `exp` inside the signed bytes), with a **short TTL** (e.g. 10 minutes), set only on the server at invalidation. It exists solely so an idempotency retry that straddles a session change still resolves to the original owner.
+
+| # | Requirement | How the design satisfies it |
+|---|---|---|
+| 1 | Signed, time-limited, server-validated | Same HMAC + `exp`-in-payload format as §24.1; validated server-side with a timing-safe compare and `iat ≤ now < exp` on **every** use; never trusted raw. |
+| 2 | Preserves only the idempotency owner; no access to order details | Its whole content is a prior `sid`; the only value derived is `hash(prev_sid)`. It is consulted **only** inside the idempotency conflict lookup on the **checkout create** path — never on `get_order_by_token` or any read path, and it returns an order **only** for a matching `(prev_owner, key)` (never enumeration, never arbitrary fetch). Reading an order still requires the unguessable `public_token`. |
+| 3 | Cannot impersonate the original owner *by another guest* | HttpOnly (JS cannot read it) and HMAC-signed (cannot be forged); it lives only in the original browser that received it, so another guest neither holds nor can mint it. Scope is single-purpose (checkout create), so possession never grants read or admin access. |
+| 4 | Not replayable beyond expiry | `exp` is inside the signed bytes; the server rejects an expired or tampered cookie and does not honour it thereafter. |
+| 5 | Does not bypass CSRF, Origin or method checks | Origin/`Sec-Fetch-Site`, the server-derived CSRF token and POST-only run **identically** regardless of which cookie supplied the owner. The grace cookie is evaluated **after** those checks and cannot skip them; it never applies to GET. |
+| 6 | Renewal / invalidation / concurrency cannot duplicate or cross-expose | Renewal keeps the same `sid` (unchanged owner). Invalidation adds the previous owner as a *secondary* lookup only. Concurrency is handled by the composite unique `(idempotency_owner, idempotency_key)` with `ON CONFLICT DO NOTHING` + re-select, plus deterministic `product_id` lock ordering — so two simultaneous requests yield one row, and two different owners never share a row. |
+
+**Test execution status — nothing has been executed.** No database, routing or cookie code exists yet, so **every** test in §15 and §24.6 is **SPECIFIED ONLY, not executed**. Do not read any of them as passing. They become executable in the Stage 3 implementation step (schema + RPC via `supabase start` / scratch project, then the API route), and results will be reported with pass/fail then. The table above is a **design argument**, not a test result.
+
+**Exact grace-cookie checks to run when implemented (all currently specified, not executed):**
+- [ ] **G1** Set the grace cookie with a past `exp` → server rejects it (no idempotency match, new order is created).
+- [ ] **G2** Tamper one byte of the grace cookie → rejected; the primary path is unaffected.
+- [ ] **G3** Another guest presents a copied grace cookie value → signature still valid for the signer but the guest never holds it; assert it is unusable without the matching `sid`/browser and grants **no** read access.
+- [ ] **G4** Post-invalidation retry with the same key → resolves to the **original** order via the grace owner; a *different* key creates a new order.
+- [ ] **G5** Grace cookie present + wrong CSRF/Origin → still **403** (proves it does not bypass those checks).
+- [ ] **G6** Grace cookie present, then a normal read (`get_order_by_token` with a wrong token) → returns nothing (proves the grace cookie is create-only).
