@@ -1,8 +1,22 @@
-# Stage 3 — Supabase schema, RLS & migration plan (FINAL v4 SECURITY REVIEW, FOR REVIEW)
+# Stage 3 — Supabase schema, RLS & migration plan (FINAL v5 — DECISIONS RECORDED, FOR APPROVAL)
 
 Status: **proposed — not applied.** No database objects created. No credentials used or committed. Base44 site untouched.
-Supersedes v1–v3. Awaiting explicit approval before implementation.
-v3 architecture approved in principle; v4 adds the requested final security review (§17–§21) and consolidates the decisions required for approval (§16).
+Supersedes v1–v4. Awaiting **separate explicit approval** before implementation.
+v4 security review accepted; v5 adds the idempotency-key security correction (§17.1), **records the owner's decisions B1–B4 / N1–N7** (§16), and adds the final implementation checklist (§23).
+
+---
+
+## 0c. What changed in v5 (mapped to your corrections & decisions)
+
+| # | Your instruction | v5 response |
+|---|---|---|
+| 1 | Scope idempotency keys to the customer/guest session | ✅ `idempotency_key` is bound to the caller and re-checked against session/email (§17.1). |
+| 2 | Reject reuse of an existing key with a different payload | ✅ `payload_hash` stored; same key + different payload → rejected (§17.1). |
+| 3 | Duplicates must not expose another customer's order or guest token | ✅ On conflict, the existing order is returned **only** if the same caller owns it (§17.1). |
+| 4 | Retrieving an existing order requires authorisation | ✅ Conflict-return and `get_order_by_token` both require the matching caller/token (§17.1, §7). |
+| 5 | Per-IP rate limiting uses a trusted server-derived IP | ✅ IP taken from the trusted proxy header server-side only; never from client input (§17.1). |
+| 6 | Record decisions B1–B4, N1–N7 | ✅ Recorded verbatim as DECIDED (§16). |
+| 7 | Final implementation checklist | ✅ Added (§23). |
 
 ---
 
@@ -132,8 +146,8 @@ where bt.box_theme_id = $1 and p.box_eligible and p.visible and p.stock > 0;
 ```
 
 ### 4.5 `orders`
-`id uuid PK` · `order_reference text NOT NULL UNIQUE` · **`public_token uuid NOT NULL UNIQUE DEFAULT gen_random_uuid()`** · **`idempotency_key uuid NULL UNIQUE`** (client-supplied; prevents duplicate submissions, §17) · `user_id uuid NULL → auth.users(id) ON DELETE SET NULL` · `customer_name`, `customer_email`, `phone`, `address`, `city`, `province`, `postal_code`, `gift_note` · `items jsonb NOT NULL DEFAULT '[]'` · `subtotal`, `delivery_fee`, `total` `numeric(10,2) NOT NULL DEFAULT 0` · `status order_status NOT NULL DEFAULT 'pending_payment'` · `payment_status payment_status NOT NULL DEFAULT 'unpaid'` · **`paid_at timestamptz NULL`** · **`gateway_ref text NULL`** (verified Yoco reference, server-written only) · **`stock_conflict bool NOT NULL DEFAULT false`** (set if a late verified payment cannot be reserved, §19) · `created_at`, `updated_at`.
-Indexes: unique `order_reference`, unique `public_token`, unique `idempotency_key`, `(customer_email)`, `(created_at desc)`.
+`id uuid PK` · `order_reference text NOT NULL UNIQUE` · **`public_token uuid NOT NULL UNIQUE DEFAULT gen_random_uuid()`** · **`idempotency_key uuid NULL`** (client-supplied) · **`idempotency_payload_hash text NULL`** · **`idempotency_owner text NULL`** (scope: `auth.uid()` for signed-in, else a hashed guest session id → §17.1) · `user_id uuid NULL → auth.users(id) ON DELETE SET NULL` · `customer_name`, `customer_email`, `phone`, `address`, `city`, `province`, `postal_code`, `gift_note` · `items jsonb NOT NULL DEFAULT '[]'` · `subtotal`, `delivery_fee`, `total` `numeric(10,2) NOT NULL DEFAULT 0` · `status order_status NOT NULL DEFAULT 'pending_payment'` · `payment_status payment_status NOT NULL DEFAULT 'unpaid'` · **`paid_at timestamptz NULL`** · **`gateway_ref text NULL`** (verified Yoco reference, server-written only) · **`stock_conflict bool NOT NULL DEFAULT false`** (set if a late verified payment cannot be reserved, §19) · `created_at`, `updated_at`.
+Indexes: unique `order_reference`, unique `public_token`, unique **`(idempotency_owner, idempotency_key)`**, `(customer_email)`, `(created_at desc)`.
 
 ### 4.6 `store_settings` (singleton, `id = 1`)
 `delivery_fee numeric(10,2) NOT NULL DEFAULT 100` · `store_name` · `slogan` · `delivery_info` · `refund_policy` · `privacy_policy` · `terms` · `contact_email` · `contact_phone` · `payment_link` · **`social_instagram`/`social_facebook`/`social_tiktok` `text NULL`** · `updated_at`.
@@ -306,7 +320,7 @@ grant execute on function public.get_order_by_token(uuid) to anon, authenticated
 - `payment_status` starts `unpaid` and is **never** settable by the client (no INSERT policy; not a parameter of `create_order`).
 - The Yoco redirect/return is **informational only** — it does **not** set `paid` and is never treated as proof of payment. The return page may *show* "awaiting payment confirmation".
 - **Only independently verified outcomes change payment status**: an admin marking the order paid after checking the gateway, or (later) a server-side Yoco verification/webhook call. `paid_at` records when verification happened.
-- On verified `paid`: `settle_order(order_id, outcome)` is called server-side — it sets `payment_status='paid'`, commits the order's `held` reservations to `committed`, and decrements `products.stock` (pending reference confirmation, §16).
+- On verified `paid`: `settle_order(order_id, outcome)` is called server-side — it sets `payment_status='paid'`, commits the order's `held` reservations to `committed`, and decrements `products.stock`. **Decided (B3):** stock is decremented **only** at this independently verified point; before payment, stock is held by atomic reservations, never decremented.
 - On `failed` (recorded server-side only): `held` reservations are released.
 - Admin cancelling an unpaid order calls `release_expired_reservations()`-equivalent release for that order, returning stock.
 
@@ -325,6 +339,8 @@ grant execute on function public.get_order_by_token(uuid) to anon, authenticated
 - If it is **not** available: the sequence is **not** seeded with any speculative value (the earlier "default 1001" is **withdrawn**), and **checkout cannot be enabled** until the rule is confirmed. I will not invent a starting point.
 
 **Blocking input for checkout (see §16):** provide either a few real production references **or** the Base44 backend function source. Until then, `orders.order_reference` stays `NOT NULL UNIQUE` but the sequence is left unseeded and checkout is off.
+
+> **✅ Decision B2 (recorded): do not seed until verified.** The sequence will **not** be seeded and **checkout remains disabled** until verified existing order references or the backend source are available. No starting number will be assumed.
 
 ---
 
@@ -416,6 +432,8 @@ Supabase's backup features depend on plan tier (verify against Supabase's curren
 
 **Please confirm** your current tier (Free or Pro) so I can state the exact automated-backup position (**point 10**). **No upgrade is recommended** until the actual tier is confirmed; an upgrade is only worth discussing afterwards and only if you want automated daily backups or PITR.
 
+> **✅ Decision B4 (recorded): assume Free; manual backups.** Planning proceeds on the **Free** tier and uses the **manual dump process** below until the actual account tier is confirmed. No paid upgrade is undertaken.
+
 ---
 
 ## 15. Security test checklist (run after applying; `scripts/verify-schema.ts`)
@@ -475,28 +493,30 @@ Supabase's backup features depend on plan tier (verify against Supabase's curren
 
 ---
 
-## 16. Decisions required from you before approval
+## 16. Decisions — RECORDED (owner-approved)
 
-**Blocking — implementation cannot proceed correctly without these:**
+All previously outstanding decisions are now **resolved and recorded verbatim**. No open questions remain; implementation is gated only on your separate explicit approval.
 
-| # | Decision | Why it blocks | Default if you say "use your judgement" |
-|---|---|---|---|
-| B1 | **Yoco verification route** (§18) | Determines whether `paid` can be set automatically and safely. The current **static payment link cannot be independently verified** — this is the single most important decision. | Manual admin verification only (no auto-`paid`); no webhook until a verifiable integration is chosen. |
-| B2 | **Order-reference samples or backend source** (§9) | The sequence must be seeded to continue the live `gees1007` series; guessing is prohibited. | None — checkout stays disabled. |
-| B3 | **Stock-decrement timing** (§6.2, §19) | Decides whether stock commits at order creation or at verified payment. | Commit at verified payment (reservation model). |
-| B4 | **Supabase tier** (Free/Pro) (§14) | Determines the real backup/restore position; no upgrade recommended until known. | Assume Free; keep manual dumps. |
+**Blocking decisions — resolved:**
 
-**Non-blocking — sensible defaults proposed; confirm or override:**
-
-| # | Decision | Proposed default |
+| # | Decision | Recorded outcome |
 |---|---|---|
-| N1 | Build-a-Box pack discount (§6.1) | No discount: pack total = sum of individual prices. |
-| N2 | `EmailSetting` export (§10) | If not supplied, seed **empty** templates (reference fallback). |
-| N3 | `payment_status='failed'` usage (§8) | Keep the value; set only server-side on a verified failure. |
-| N4 | Reservation window (§19) | 30 minutes, configurable in `store_settings`. |
-| N5 | Late-payment-after-release policy (§19) | Flag `stock_conflict=true` for manual handling; never oversell. |
-| N6 | Apply method (§13) | Versioned Supabase CLI migrations (not dashboard SQL). |
-| N7 | Rate limiting (§17) | Per-IP limit on the checkout API route (e.g. 10/min) + idempotency key. |
+| B1 | **Yoco verification** | **Manual admin verification initially.** Preserve the **existing static Yoco payment link**. **Do not** introduce the Checkout API or automatic payment integration during the initial extraction. *(§18)* |
+| B2 | **Order references** | **Do not seed** `order_reference_seq` until verified existing order references or the backend source are available. **Checkout stays disabled** until then. *(§9)* |
+| B3 | **Stock decrement** | Decrement `products.stock` **only after independently verified payment**; keep **atomic reservations before payment**. *(§6.2, §19)* |
+| B4 | **Supabase tier** | **Assume Free** for planning; use **manual backups** until the actual account tier is confirmed. *(§14)* |
+
+**Non-blocking decisions — recorded:**
+
+| # | Decision | Recorded outcome |
+|---|---|---|
+| N1 | Build-a-Box | **No discount** (pack total = sum of individual prices). |
+| N2 | Email templates | **Export verbatim if possible; otherwise leave empty.** |
+| N3 | `failed` status | **Retain**; set only after a **verified** failure. |
+| N4 | Reservation window | **30 minutes.** |
+| N5 | Late payment w/o stock | **`stock_conflict`** for late payment where stock is unavailable. |
+| N6 | Migrations | **CLI migrations.** |
+| N7 | Rate limiting | **Per-IP** (trusted server-derived IP, §17.1). |
 
 ---
 
@@ -518,7 +538,19 @@ All validation happens **inside `create_order()`** (and a thin API route that ne
 | payload size | Whole JSON payload **≤ 64 KB**, enforced in the RPC and the API route. |
 | price / delivery_fee / total | **Never accepted from the client** — recomputed from `products` + `store_settings`. |
 
-**Duplicate-submission protection:** the checkout form generates an `idempotency_key uuid` (stored in `orders.idempotency_key UNIQUE`). `create_order()` does `INSERT … ON CONFLICT (idempotency_key) DO NOTHING RETURNING …`; on conflict it returns the **existing** order (same `order_reference`/`public_token`) instead of creating a second. A repeated POST / double-click therefore yields one order. Additionally: per-IP rate limiting on the API route (N7) and a soft dedupe on `(customer_email, items-hash, created_at < 60s)`.
+**Duplicate-submission protection:** the checkout form generates an `idempotency_key uuid`. `create_order()` performs a scoped `INSERT … ON CONFLICT (idempotency_owner, idempotency_key) DO NOTHING`; a repeated POST / double-click therefore yields one order. Additionally: per-IP rate limiting on the API route (N7) and a soft dedupe on `(customer_email, items-hash, created_at < 60s)`.
+
+### 17.1 Idempotency-key security (v5 correction)
+An idempotency key is **never a global handle** — it is scoped, payload-bound and authorisation-checked:
+
+1. **Scoped to the caller.** `idempotency_owner` = `auth.uid()` for a signed-in customer, or a **server-derived, httpOnly-cookie guest session id** (hashed) for a guest. The unique constraint is `(idempotency_owner, idempotency_key)`, so two different customers may use the same key value without colliding, and one customer's key can never address another's row.
+2. **Payload-bound.** The server computes `idempotency_payload_hash = sha256(canonical(items + customer fields))` and stores it. On a key hit:
+   - **same owner + same payload** → return the existing order (its `order_reference`/`public_token`) — a true retry;
+   - **same owner + different payload** → **reject** (`idempotency_key_reused`), so a key cannot be recycled to create a different order;
+   - **different owner** → treated as a brand-new key (isolated by the composite unique constraint) — never returns or reveals the other customer's order.
+3. **No cross-customer exposure.** The conflict path returns data **only** to the same `idempotency_owner`; a guest therefore cannot retrieve another guest's order or token by guessing a key.
+4. **Authorisation on retrieval.** Returning an existing order on conflict requires the same owner; **any other retrieval** (confirmation link) goes through `get_order_by_token()` with the unguessable 122-bit token (§7). There is no lookup-by-key API.
+5. **Trusted IP for rate limiting.** The per-IP limit uses an IP **derived server-side** from the platform's trusted proxy header (e.g. Vercel's `x-forwarded-for` first hop set by the platform) inside the server route/middleware — **never** a client-supplied `X-Forwarded-For` or body value. If no trusted header is present, the limit falls back to a conservative global bucket rather than trusting the client.
 
 ---
 
@@ -531,6 +563,8 @@ All validation happens **inside `create_order()`** (and a thin API route that ne
 3. **Manual admin verification.** An admin checks the Yoco dashboard and marks the order paid.
 
 > **⚠ Limitation you must decide on (B1).** The current artefact is a **static hosted payment link** (`pay.yoco.com/gees-convenience-store`). A static link does **not** return a gateway transaction id we can independently verify and does not raise a **signed webhook bound to our order**. Therefore, with the static link alone, route (1)/(2) are **not** available and only **route (3) manual verification** is trustworthy. Automatic verification requires moving to the **Yoco Checkout API** (server-created per-order checkout) and/or registered **webhooks**. This is decision **B1**.
+
+> **✅ Decision B1 (recorded): manual admin verification, for now.** Keep the **existing static Yoco payment link** and **do not introduce the Yoco Checkout API or any automatic payment integration during the initial extraction**. Orders therefore move to `paid` **only** when an admin verifies the payment against the Yoco dashboard and records it server-side. `settle_order()`, `payment_events` and the idempotency rules above are **built and kept ready** (so an automated route can be added later without schema change), but **no webhook/Checkout-API path is wired in Stage 3**.
 
 **Idempotency & duplicate notifications:**
 - Every notification is keyed by `payment_events.event_id UNIQUE`; a repeat insert **conflicts and is ignored** (no double settlement).
@@ -631,6 +665,50 @@ Each rollback file states its **preconditions** (dependent objects already remov
 
 ---
 
-## 22. Summary of outstanding decisions
+## 22. Outstanding decisions
 
-Only **B1–B4** (§16) block implementation. **B1 (Yoco verification route)** is the most consequential: the current static payment link cannot be independently verified, so automatic `paid` is impossible without a verifiable integration — the default fallback is manual admin verification. **N1–N7** have sensible defaults and can proceed unless you override them.
+**None.** All blocking (B1–B4) and non-blocking (N1–N7) decisions are **recorded in §16**. The design is frozen pending your separate explicit approval to implement; the final implementation checklist follows.
+
+---
+
+## 23. Final implementation checklist (for approval)
+
+**Pre-implementation (no DB objects created)**
+- [ ] Owner approval to implement Stage 3 received.
+- [ ] Confirm Supabase tier = Free (B4) and that manual dumps are the accepted backup (no upgrade).
+- [ ] Confirm the store owner's admin email for first-admin provisioning.
+
+**Migration authoring (versioned CLI, each with a separate rollback file, §13/§21)**
+- [ ] `0000` extensions · `set_updated_at()` · `is_admin()`
+- [ ] `0001` enum types (incl. `reservation_status`)
+- [ ] `0002` `profiles` + `handle_new_user()` + `prevent_role_escalation()` + triggers
+- [ ] `0003` `categories` (+ unique slug)
+- [ ] `0004` `box_themes` + `box_theme_categories`
+- [ ] `0005` `products` (FK → categories)
+- [ ] `0006` `orders` (+ `public_token`, `idempotency_*`, `stock_conflict`) · `order_reference_seq` · `next_order_reference()` · `stock_reservations` · `payment_events`
+- [ ] `0007` `store_settings`
+- [ ] `0008` `email_settings` · `email_logs` (`order_id` FK)
+- [ ] `0009` `create_order` · `get_order_by_token` · `settle_order` · `release_expired_reservations` · `reassign_products_category` (+ hardening: `revoke from public`, grants, pinned `search_path`, schema-qualified)
+- [ ] `0010` seed categories · box themes · theme-category links (**7**) · **25** products (verbatim snapshots)
+- [ ] `0011` seed `store_settings` singleton (delivery **R100**, null social)
+- [ ] `0012` seed `email_settings` (verbatim export if available, else empty — N2)
+- [ ] matching `supabase/rollback/NNNN_*.sql` for every migration, with stated preconditions
+- [ ] RLS enabled on all **11** tables; policies per §12; column-level + sequence revokes per §20
+- [ ] **Gated:** `order_reference_seq` seeding left undone; **checkout disabled** (B2)
+
+**Verification (on a scratch project, §15/§21)**
+- [ ] `scripts/verify-schema.ts` passes checklist **A / C / H**
+- [ ] anon/customer negative RLS tests pass (**B**)
+- [ ] price-tampering + idempotency (scoped key, payload-hash rejection) tests pass (**D**, §17.1)
+- [ ] guest-retrieval whitelist tests pass (**E**)
+- [ ] concurrency + lifecycle tests pass (**F**)
+- [ ] payments: redirect cannot set `paid`; duplicate/invalid-signature events are no-ops (**G**)
+- [ ] rollback drill `0012 → 0000` succeeds on a throwaway DB (**H**)
+
+**Explicitly NOT in Stage 3**
+- [ ] No Yoco Checkout API / webhook wiring (B1 — manual verification only).
+- [ ] No checkout sequence seeding or live checkout (B2).
+- [ ] No storage buckets, no data/asset migration, no deployment, no domain switch.
+- [ ] Base44 site remains online and untouched.
+
+**Reported before any DB change:** confirm this checklist; only then create migrations, apply to the project and run the verification suite.
