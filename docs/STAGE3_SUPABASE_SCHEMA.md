@@ -1,8 +1,20 @@
-# Stage 3 — Supabase schema, RLS & migration plan (FINAL v5 — DECISIONS RECORDED, FOR APPROVAL)
+# Stage 3 — Supabase schema, RLS & migration plan (FINAL v6 — GUEST-SESSION BOUNDARY, FOR APPROVAL)
 
 Status: **proposed — not applied.** No database objects created. No credentials used or committed. Base44 site untouched.
-Supersedes v1–v4. Awaiting **separate explicit approval** before implementation.
-v4 security review accepted; v5 adds the idempotency-key security correction (§17.1), **records the owner's decisions B1–B4 / N1–N7** (§16), and adds the final implementation checklist (§23).
+Supersedes v1–v5. Awaiting **separate explicit approval** before implementation.
+v5 recorded the owner's decisions; v6 closes the guest-session security boundary (§24) with HMAC-expiry cookies, CSRF protection, a non-deprecated service-role check, and rotation-safe idempotency.
+
+---
+
+## 0d. What changed in v6 (mapped to your four points)
+
+| # | Your requirement | v6 response |
+|---|---|---|
+| 1 | HMAC expiry protection | ✅ The signed payload now carries `exp`; the server verifies signature **and** expiry, so an old cookie cannot be replayed (§24.1). |
+| 2 | CSRF beyond `SameSite=Lax` | ✅ Route Handler enforces **Origin/`Sec-Fetch-Site` validation + a double-submit CSRF token + POST-only** (§24.2). |
+| 3 | `auth.role()` deprecation | ✅ Replaced with the current recommended claim check `(auth.jwt() ->> 'role')` (with the underlying `request.jwt.claims` noted) (§24.3). |
+| 4 | Rotation-safe idempotency | ✅ **Renewal** (same `sid`, extended `exp`) vs **invalidation** (new `sid`); a new `sid` is never issued mid-checkout, and a payload-hash dedupe window backstops any post-rotation retry (§24.4). |
+| 5 | Revised SQL signature, grants, flow, tests | ✅ §6.1, §6.3, §24.5, §15/§24.6. |
 
 ---
 
@@ -194,10 +206,29 @@ store_settings (single row)   ·   email_settings (one row per email_type)
 **No client `INSERT` on `orders`.** The policy is revoked for `anon`/`authenticated`; the only path is the `create_order()` RPC:
 
 ```sql
-create function public.create_order(payload jsonb) returns jsonb
+create function public.create_order(
+  payload jsonb,
+  p_idempotency_key uuid,
+  p_guest_owner text default null
+) returns jsonb
 language plpgsql security definer set search_path = public, pg_temp as $$
-declare v_fee numeric; v_sub numeric(10,2) := 0; it jsonb; v_line jsonb; ...
+declare v_fee numeric; v_sub numeric(10,2) := 0; it jsonb; v_line jsonb;
+        v_owner text;   -- identity is derived HERE, never taken from the browser
 begin
+  -- ── Identity: the DB establishes it; it never trusts a client-supplied owner ──
+  if auth.uid() is not null then
+    v_owner := auth.uid()::text;                       -- signed-in customer
+  elsif (auth.jwt() ->> 'role') = 'service_role' then  -- server route only (see §24.3)
+    v_owner := p_guest_owner;                          -- validated by the server, trusted here
+    if v_owner is null then raise exception 'missing_guest_owner' using errcode = '22023'; end if;
+  else
+    raise exception 'guest_checkout_requires_server' using errcode = '42501';
+  end if;
+
+  -- ── Idempotency: scoped to (owner, key); same key + different payload is rejected ──
+  --   (logic in §17.1; returns the existing order on a true retry)
+  ...
+
   -- Fee: server-side only. R100 standard charge from store settings; NO free-delivery threshold.
   select public.store_settings.delivery_fee into v_fee from public.store_settings where id = 1;
 
@@ -206,9 +237,9 @@ begin
     v_sub  := v_sub + (v_line->>'line_total')::numeric;   -- prices from DB, NOT the client
   end loop;
 
-  insert into public.orders ( ... , status, payment_status )   -- forced literals
-  values ( public.next_order_reference(), auth.uid(), ..., v_sub, v_fee, v_sub + v_fee,
-           'pending_payment', 'unpaid' )
+  insert into public.orders ( ... , idempotency_owner, idempotency_key, status, payment_status )
+  values ( public.next_order_reference(), v_owner, p_idempotency_key, ...,
+           v_sub, v_fee, v_sub + v_fee, 'pending_payment', 'unpaid' )
   returning id, order_reference, public_token, total into ...;
 
   return jsonb_build_object('order_reference', ..., 'public_token', ..., 'total', ...);
@@ -219,7 +250,7 @@ Guarantees:
 - **Prices/subtotal** come from `public.products` (`COALESCE(sale_price, price)`) — client-supplied prices are ignored.
 - **Delivery fee** comes from `public.store_settings` (default **R100**) — not client-supplied, and **no free-delivery threshold** is introduced (point 5).
 - **Total** = `subtotal + delivery_fee`, computed in the function.
-- **Ownership**: `user_id` is set from `auth.uid()` only; the client cannot choose it.
+- **Ownership / idempotency owner** is derived **inside** the function: `auth.uid()` for signed-in callers, or the server-validated guest id for a **service-role** caller. A guest identity supplied by a browser (an `anon` caller) is **refused** (§24).
 - **Payment state**: `status`/`payment_status` are literals inside the function; unreachable from the client.
 
 **Build-a-Box preservation (point 4):** `resolve_line` keeps the existing **5 / 10 / 15** pack sizes, prices each line from the **individual product price**, and applies the existing eligibility rules (`box_eligible !== false AND visible !== false`, theme filtered to its categories). Pack sizes are counts, not fixed bundle prices — no bundle price is invented. Theme/category assignments are the existing links in `box_theme_categories` (§4.4).
@@ -255,9 +286,10 @@ This prevents overselling under concurrency: availability is always `stock − h
 ### 6.3 `SECURITY DEFINER` hardening (point 1)
 Every `SECURITY DEFINER` function (`create_order`, `get_order_by_token`, `next_order_reference`, `release_expired_reservations`, `reassign_products_category`, `is_admin`) follows these rules:
 
-1. **Revoke the implicit PUBLIC grant** first: `revoke all on function public.<fn>(<args>) from public;`
+1. **Revoke the implicit PUBLIC grant** first: `revoke all on function public.<fn>(<args>) from public;` — and **from `anon`** on `create_order` specifically.
 2. **Grant only to intended roles** — least privilege:
-   - `create_order(jsonb)`, `get_order_by_token(uuid)` → `grant execute … to anon, authenticated;`
+   - `create_order(jsonb, uuid, text)` → `grant execute … to authenticated, service_role;` **never `anon`** (guest checkout goes through the server route, §24.3).
+   - `get_order_by_token(uuid)` → `grant execute … to anon, authenticated;` (unguessable token + field whitelist, §7).
    - `release_expired_reservations()` → `grant execute … to authenticated;` (body is idempotent; no admin check needed)
    - `reassign_products_category(text, text)` → `grant execute … to authenticated;` with an **internal `is_admin()` check** (never granted to `anon`)
    - `is_admin()` → `grant execute … to authenticated;`
@@ -594,7 +626,7 @@ An idempotency key is **never a global handle** — it is scoped, payload-bound 
 
 | Object | Type | Exposure | Bypass considered | Mitigation |
 |---|---|---|---|---|
-| `create_order(jsonb)` | definer fn | `anon, authenticated` | price/fee/owner/payment tampering; huge payload; dup submit | server-side validation + recompute (§17), forced literals, idempotency key |
+| `create_order(jsonb,uuid,text)` | definer fn | **`authenticated, service_role`** (never `anon`) | price/fee/owner/payment tampering; forged guest owner; huge payload; dup submit | identity derived in-function (§6.1); server route for guests (§24.3); validation + recompute (§17), forced literals, idempotency key |
 | `get_order_by_token(uuid)` | definer fn | `anon, authenticated` | leak internal fields; token brute-force | explicit field whitelist (§7); 122-bit token; exact match |
 | `settle_order(...)` | definer fn | **service role only** | client setting `paid` | not granted to anon/authenticated; idempotent guard (§18) |
 | `release_expired_reservations()` | definer fn | `authenticated` | abusive repeated calls; data change beyond expiry | body only flips `held`→`expired`; no data read back |
@@ -602,7 +634,7 @@ An idempotency key is **never a global handle** — it is scoped, payload-bound 
 | `is_admin()` | definer fn | `authenticated` | claim spoofing | reads `profiles` only, never JWT claims (§11) |
 | `next_order_reference()` | definer fn | **no direct grant** (used inside `create_order`) | clients burning sequence numbers | `revoke … from public`, granted to no client role |
 | `handle_new_user()` | trigger fn on `auth.users` | trigger-only | role injection via metadata | hardcodes `role='customer'` (§11) |
-| `prevent_role_escalation()` | trigger fn on `profiles` | trigger-only | self-promotion | raises unless `auth.role()='service_role'` (§11) |
+| `prevent_role_escalation()` | trigger fn on `profiles` | trigger-only | self-promotion | raises unless `(auth.jwt() ->> 'role') = 'service_role'` (§11, §24.3) |
 | `set_updated_at()` | trigger fn | trigger-only | — | invoker-rights, no definer |
 
 **Grants & schema:**
@@ -703,7 +735,12 @@ Each rollback file states its **preconditions** (dependent objects already remov
 - [ ] guest-retrieval whitelist tests pass (**E**)
 - [ ] concurrency + lifecycle tests pass (**F**)
 - [ ] payments: redirect cannot set `paid`; duplicate/invalid-signature events are no-ops (**G**)
+- [ ] guest-boundary tests pass: forged-owner refusal, HMAC/expiry tamper, CSRF 403, rotation safety, cross-guest isolation (§24.6)
 - [ ] rollback drill `0012 → 0000` succeeds on a throwaway DB (**H**)
+
+**Env / config (server-only, no secrets committed)**
+- [ ] `GUEST_SESSION_SECRET` added to `.env.local.example` + Vercel (server-only; never `NEXT_PUBLIC_*`).
+- [ ] No `auth.role()` anywhere in the migration SQL (replaced by `auth.jwt() ->> 'role'`).
 
 **Explicitly NOT in Stage 3**
 - [ ] No Yoco Checkout API / webhook wiring (B1 — manual verification only).
@@ -712,3 +749,72 @@ Each rollback file states its **preconditions** (dependent objects already remov
 - [ ] Base44 site remains online and untouched.
 
 **Reported before any DB change:** confirm this checklist; only then create migrations, apply to the project and run the verification suite.
+
+---
+
+## 24. Guest-session security boundary (v6)
+
+**Principle:** the database never trusts a browser-supplied guest identity. The **server** establishes, signs, validates and forwards it; the DB accepts a guest owner **only** from a `service_role` (server) caller and **refuses** it from `anon`.
+
+### 24.1 Cookie format — HMAC over payload **including expiry** (point 1)
+Cookie `gees_guest`, value `"<payload>.<sig>"` where:
+- `payload` = base64url(`{"sid":<128-bit random>,"iat":<epoch>,"exp":<epoch>}`) — **`exp` is inside the signed bytes**, so tampering with it invalidates the signature.
+- `sig` = base64url(HMAC‑SHA256(`payload`, `GUEST_SESSION_SECRET`)).
+- Attributes: `HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=<ttl>`; set **only** by a server action/route handler.
+
+**Server validation (every use):** recompute the HMAC and compare with a **timing-safe** equality; then require `iat ≤ now < exp`. If the signature is invalid, or `exp` has passed, the cookie is **rejected and replaced** — an old cookie **cannot be replayed indefinitely**. `GUEST_SESSION_SECRET` is server-only (never a `NEXT_PUBLIC_*` var, never sent to the browser).
+
+### 24.2 CSRF protection (point 2)
+`SameSite=Lax` is **not** the only control. The checkout Route Handler additionally requires, on every POST:
+1. **Origin check** — `Origin` (or `Referer` when `Origin` is absent) must equal the app's canonical origin; `Sec-Fetch-Site` must be `same-origin`. Otherwise **403**.
+2. **Double-submit CSRF token** — a random `csrf` token is issued alongside the guest cookie (its own `HttpOnly` cookie **and** embedded in the checkout form). On POST, the form field must match the cookie value (timing-safe compare). A cross-site page cannot read the cookie, so it cannot forge the field.
+3. **POST-only** — non-POST methods are rejected.
+4. **Idempotency** — a replayed POST is additionally absorbed by the idempotency key (§17).
+
+No state-changing operation is exposed via GET. The CSRF token is bound to the guest session and rotated with it (§24.4).
+
+### 24.3 Supabase role validation — not `auth.role()` (point 3)
+`auth.role()` is deprecated. The function uses the **current recommended claim check** instead:
+
+```sql
+elsif coalesce(auth.jwt() ->> 'role', 'anon') = 'service_role' then  -- server route only
+```
+- `auth.jwt() ->> 'role'` reads the **signed** `role` claim from the verified JWT (the underlying GUC is `request.jwt.claims`).
+- The value is **not browser-forgeable**: `anon`/`authenticated` keys yield `anon`/`authenticated`; only the **service-role secret** (server-only) yields `service_role`.
+- **Performance note:** wrap the call as `(select auth.jwt() ->> 'role')` to avoid per-row re-evaluation when used in policies.
+- The same substitution applies to `prevent_role_escalation()` (§11) and any future definer check.
+
+### 24.4 Session rotation vs idempotency (point 4)
+Two distinct operations, deliberately separated:
+- **Renewal** — extend `exp` while keeping the **same `sid`**. Safe at any time: the owner (`hash(sid)`) is unchanged, so an in-progress or repeated checkout still maps to the same `(idempotency_owner, idempotency_key)` and returns the same order. Renewal is the default.
+- **Invalidation** — issue a **new `sid`**. Only on: sign-in (guest retired in favour of `auth.uid()`), explicit logout/clear, or suspected abuse. **Never issued while a checkout request is in flight, and not until after a successful order has been fully acknowledged.**
+
+Because a new `sid` changes the owner, a post-rotation retry with the same key would otherwise look like a new order. Two guards prevent a duplicate:
+1. **Grace window** — after invalidation the previous signed cookie is still accepted (same owner) for a short overlap, so a late retry lands on the same owner.
+2. **Payload-hash dedupe** — `(customer_email, idempotency_payload_hash, created_at < 60s)` is checked independently of the owner; an identical recent order is returned instead of created.
+
+Net effect: rotation cannot invalidate an in-progress order, cannot break a repeat request, and idempotency stays reliable.
+
+### 24.5 Proposed request flow
+```
+Browser ──POST /api/checkout──► Route Handler (server-only)
+  1. Origin / Sec-Fetch-Site check + CSRF token match (double-submit)     → else 403
+  2. Resolve identity server-side:
+       signed-in?  → createClient() [user JWT]         → auth.uid() branch
+       else        → read gees_guest cookie → verify HMAC + exp → validated sid
+  3. Guest path: createAdminClient() [service_role] ─► create_order(payload, key, hash(sid))
+     Signed-in path: createClient() [JWT]            ─► create_order(payload, key)
+  4. Function derives owner IN-FUNCTION; refuses forged owner from `anon`
+  5. Return order_reference + public_token + total (whitelist only)
+```
+Files: existing [server.ts](file:///workspace/src/lib/supabase/server.ts) (signed-in), [admin.ts](file:///workspace/src/lib/supabase/admin.ts) (guest, service-role, server-only); **to create** `src/lib/guest/session.ts` (`getOrCreateGuestId`, `verifyGuestCookie`, `rotateGuestId`, `clearGuestId`) and `src/app/api/checkout/route.ts`; **new env** `GUEST_SESSION_SECRET`.
+
+### 24.6 Additional security test cases (guest boundary)
+- [ ] **Forged guest owner** — call `create_order` with the **anon** key and a `p_guest_owner` → assert `42501 guest_checkout_requires_server` (nothing inserted).
+- [ ] **Service-role path** — call via the server route → assert the order is created with `idempotency_owner` = the server-derived hash, not any client value.
+- [ ] **HMAC tamper** — flip a byte of the cookie payload, or change `exp` → assert the server rejects and reissues.
+- [ ] **Expired cookie replay** — present a validly-signed cookie whose `exp` is in the past → assert rejection (`exp` is inside the signed payload).
+- [ ] **CSRF** — POST with a missing/`Origin`-mismatched header, or a wrong CSRF field → assert **403**, no order created.
+- [ ] **Rotation safety** — mid-checkout renewal (same `sid`) → same order on retry; after a completed order, invalidate then retry with the same key within the grace window → still one order.
+- [ ] **Cross-guest isolation** — guest B replays guest A's `idempotency_key` → different owner → separate row; B cannot read A's order or token.
+- [ ] **Claim check** — confirm no function references the deprecated `auth.role()` (grep the migration SQL).
