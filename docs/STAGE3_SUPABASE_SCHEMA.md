@@ -1,56 +1,63 @@
-# Stage 3 — Supabase schema, RLS & migration plan (FOR REVIEW)
+# Stage 3 — Supabase schema, RLS & migration plan (REVISED v2, FOR REVIEW)
 
-Status: **proposed — not applied.** No database objects have been created. Awaiting explicit approval.
-Base44 site untouched. No credentials are stored in this repo.
-
----
-
-## 1. Inspection of the existing Supabase project — BLOCKED (needs credentials)
-
-Requirement #1 asks me to confirm the project's current state. I could not run any inspection because
-there are currently **no credentials available** in this workspace:
-
-- `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` / `SUPABASE_SERVICE_ROLE_KEY` → **unset**
-- no `.env.local` present (only `.env.local.example`)
-- Supabase CLI not installed / project not linked
-
-**How to unblock (no secrets in chat):** put the values in a git-ignored `.env.local`
-(copied from `.env.local.example`). For CLI-based migrations, run `npx supabase login` and
-`npx supabase link --project-ref <ref>` locally (the DB password stays in your machine's Supabase
-CLI credential store, never in this repo or chat).
-
-**Read-only inspection I will run once credentials exist** (tables/enums/policies only — no writes):
-
-```sql
--- schema objects
-select table_name from information_schema.tables where table_schema = 'public';
-select typname from pg_type t join pg_namespace n on n.oid = t.typnamespace where n.nspname = 'public' and t.typtype = 'e';
-select tablename, policyname, cmd, roles from pg_policies where schemaname = 'public';
-select relname, relrowsecurity from pg_class where relnamespace = 'public'::regnamespace and relkind = 'r';
-select id, name from storage.buckets;
-select count(*) from auth.users;
-```
-
-**Expected result:** a brand-new, empty project (no public tables, no buckets, 0 users).
-The plan below assumes that; if the inspection shows otherwise (e.g. tables created from the
-dashboard), the migrations are additive and will not disturb them.
+Status: **proposed — not applied.** No database objects created. No credentials used or committed. Base44 site untouched.
+Supersedes v1. Awaiting explicit approval before implementation.
 
 ---
 
-## 2. Design principles
+## 0. What changed in v2 (mapped to your review points)
 
-- **Faithful to the reference data shape** (§5 of IMPLEMENTATION_PLAN.md) — same entities, same enums,
-  same field names/semantics. Nothing invented.
-- **Additive & reversible** — only `CREATE …`; every migration has a documented `-- DOWN` block.
-  No destructive `DROP`/`ALTER` of pre-existing objects.
-- **RLS as backstop, server as authority** — privileged work runs server-side (§10E); the
-  service-role key is never in the browser and never committed.
-- **Postgres conventions** — `uuid` PKs (`gen_random_uuid()`), `timestamptz`, `numeric(10,2)` for money,
-  `snake_case`, explicit `search_path` on all functions.
+| # | Your requirement | v2 response |
+|---|---|---|
+| 1 | Real join table for Build-a-Box | ✅ `box_theme_categories` join table replaces `text[]` (§4.4). Existing assignments preserved (§9). |
+| 2 | Confirm `category_slug` FK is sound | ✅ Confirmed: `categories.slug` is `UNIQUE` in the live data; FK + behaviour defined (§4.3). |
+| 3 | Server-validated orders | ✅ **Removed** client `INSERT` on `orders`. Creation only via `create_order()` — a `SECURITY DEFINER` RPC that recomputes all prices/fees/totals and fixes ownership + payment state (§6). |
+| 4 | Secure guest retrieval | ✅ Added `orders.public_token` (random UUID) + `get_order_by_token()`; retrieval never uses the guessable reference (§7). |
+| 5 | `email_logs.order_id` FK | ✅ Added `order_id` FK (nullable) as the authoritative link; `order_reference` kept as a display snapshot (§4.8). |
+| 6 | Role changes impossible for customers | ✅ Role never read from user-editable metadata; insert-time trigger + update-time trigger + no client INSERT policy (§11). |
+| 7 | Payments stay pending until verified | ✅ `payment_status` is not client-writable at all; a redirect never sets `paid` (§8). |
+| 8 | Preserve `gees1007`-style references | ✅ Confirmed server-side in the reference; reproduced via a Postgres sequence + `gees` prefix (§9). Exact rule still needs samples/backend source. |
+| 9 | Preserve reference email copy | ✅ Confirmed copy lives in the `EmailSetting` table (empty today) — not in the bundle. Requesting owner export (§10). |
+| 10 | Reviewed rollback scripts | ✅ Separate `supabase/rollback/*.sql` files, reviewed independently — not comments (§13). |
+| 11 | Document backup options first | ✅ Free vs Pro/paid options documented with an interim manual process; **no upgrade recommended** yet (§14). |
 
 ---
 
-## 3. Enums (VERIFIED from the reference bundle)
+## 1. New evidence gathered for this revision (from the reference source)
+
+**1.1 Live data (public API, re-confirmed today)**
+
+| Entity | Count | Fields actually present |
+|---|---|---|
+| `Product` | **25** | `name, description, price, category, image_url, stock, is_new, is_trending, box_eligible` (+ system) |
+| `Category` | **5** | `name, slug, sort_order` (+ system) |
+| `BoxTheme` | **4** | `name, description, categories[]` (+ system) |
+| `StoreSetting` | **0** | — (defaults come from the bundle: `wz`) |
+| `EmailSetting` | **0** | — |
+| `Order` | **0** | — |
+
+Products: price **R69–R624**, **21** box-eligible, **1** with `stock = 0`, categories = the 5 slugs.
+
+**1.2 Bundle behaviour (VERIFIED)**
+- Product entity default: `{ …, sale_price:'', visible:true, box_eligible:true }`; read paths use `box_eligible !== false`, `visible !== false`.
+- Box-product pool = `box_eligible !== false AND visible !== false AND stock > 0`, further filtered to the selected theme's `categories` when a theme is picked.
+- Category normaliser `CA = s => String(s||'').toLowerCase().trim().replace(/\s+/g,'-')`; `Category.list` maps `slug: row.slug || CA(row.name)`.
+- Fallback arrays exist in the bundle (`IA` products, `SA` categories, `YA` themes) used only when the API returns nothing — the API returns real data, so **live rows are the source of truth**.
+- Orders are created by a **Base44 backend function** (`/apps/{appId}/functions/{name}`); the client only receives `order_reference` back → the numbering rule is **not** in the public bundle.
+- Email templates live in the DB (`EmailSetting`) and are rendered by the backend (`getEmailPreview`).
+- Social links are **hardcoded** in the footer (`https://instagram.com/`, `/facebook.com/`, `/tiktok.com/`) — they are **not** in `StoreSetting`.
+
+**1.3 Schema corrections vs v1** (important): `products` gains `sale_price` (nullable) and `visible` (default true); `categories` gains `visible`; `box_themes` gains `active` + `sort_order`. All are unset in the live rows today, so the proposed defaults **reproduce current behaviour exactly**.
+
+---
+
+## 2. Inspection status — still blocked
+
+No credentials locally (env unset, no `.env.local`, CLI not linked), so I could not inspect the project's live schema. Read-only inspection queries are in v1 §1. Expected: an empty project. Add credentials to a git-ignored `.env.local` when you want me to run it.
+
+---
+
+## 3. Enums (VERIFIED)
 
 | Enum | Values |
 |---|---|
@@ -64,236 +71,244 @@ dashboard), the migrations are additive and will not disturb them.
 
 ## 4. Tables
 
-### `profiles` — 1:1 with `auth.users`
-| Column | Type | Constraints |
-|---|---|---|
-| `id` | uuid | PK, FK → `auth.users(id)` ON DELETE CASCADE |
-| `role` | user_role | NOT NULL, default `'customer'` |
-| `full_name` | text | NOT NULL, default `''` |
-| `created_at` | timestamptz | NOT NULL, default `now()` |
-| `updated_at` | timestamptz | NOT NULL, default `now()` |
+### 4.1 `profiles` (1:1 with `auth.users`)
+`id uuid PK → auth.users(id) ON DELETE CASCADE` · `role user_role NOT NULL DEFAULT 'customer'` · `full_name text NOT NULL DEFAULT ''` · `created_at`, `updated_at`.
 
-### `categories`
-| Column | Type | Constraints |
-|---|---|---|
-| `id` | uuid | PK |
-| `name` | text | NOT NULL |
-| `slug` | text | NOT NULL, **UNIQUE** |
-| `sort_order` | int | NOT NULL, default 0 |
-| `created_at` / `updated_at` | timestamptz | NOT NULL, default `now()` |
+### 4.2 `categories`
+`id uuid PK` · `name text NOT NULL` · **`slug text NOT NULL UNIQUE`** · `sort_order int NOT NULL DEFAULT 0` · `visible bool NOT NULL DEFAULT true` · timestamps.
 
-### `box_themes`
-| Column | Type | Constraints |
-|---|---|---|
-| `id` | uuid | PK |
-| `name` | text | NOT NULL |
-| `description` | text | NOT NULL, default `''` |
-| `categories` | text[] | NOT NULL, default `'{}'` — logical list of `categories.slug` |
-| `sort_order` | int | NOT NULL, default 0 |
-| `created_at` / `updated_at` | timestamptz | NOT NULL, default `now()` |
+### 4.3 `products`
+`id uuid PK` · `name text NOT NULL` · `description text NOT NULL DEFAULT ''` · `price numeric(10,2) NOT NULL CHECK (>=0)` · **`sale_price numeric(10,2) NULL CHECK (>=0)`** · `category_slug text NULL` · `image_url text NOT NULL DEFAULT ''` · `stock int NOT NULL DEFAULT 0 CHECK (>=0)` · `is_new bool NOT NULL DEFAULT false` · `is_trending bool NOT NULL DEFAULT false` · `box_eligible bool NOT NULL DEFAULT true` · **`visible bool NOT NULL DEFAULT true`** · `sort_order int NOT NULL DEFAULT 0` · timestamps.
 
-### `products`
-| Column | Type | Constraints |
-|---|---|---|
-| `id` | uuid | PK |
-| `name` | text | NOT NULL |
-| `description` | text | NOT NULL, default `''` |
-| `price` | numeric(10,2) | NOT NULL, CHECK `>= 0` |
-| `category_slug` | text | FK → `categories(slug)` ON UPDATE CASCADE ON DELETE SET NULL, nullable |
-| `image_url` | text | NOT NULL, default `''` |
-| `stock` | int | NOT NULL, default 0, CHECK `>= 0` |
-| `is_new` | bool | NOT NULL, default false |
-| `is_trending` | bool | NOT NULL, default false |
-| `box_eligible` | bool | NOT NULL, default false |
-| `sort_order` | int | NOT NULL, default 0 |
-| `created_at` / `updated_at` | timestamptz | NOT NULL, default `now()` |
+**FK (point 2):** `category_slug → categories(slug)`, which is **UNIQUE** (confirmed: the 5 live categories each have a distinct slug).
+Behaviour: `ON UPDATE CASCADE` (renaming a slug propagates — matches the app's `CA`-normalised lookups) and `ON DELETE SET NULL` (deleting a category never destroys products; they become uncategorised, which is what the reference tolerates). *Alternative considered:* `ON DELETE RESTRICT` — rejected because it would block the admin Categories tab, changing existing behaviour.
+Effective price = `COALESCE(sale_price, price)` — matches the reference's strikethrough display.
 
-Indexes: `products(category_slug)`, `products(is_new)`, `products(is_trending)`, and a
-`to_tsvector`-free simple `name ILIKE` GIN/`pg_trgm` index for header search (added in the search stage).
+### 4.4 `box_themes` + `box_theme_categories` (point 1)
+`box_themes`: `id uuid PK` · `name text NOT NULL` · `description text NOT NULL DEFAULT ''` · **`active bool NOT NULL DEFAULT true`** · `sort_order int NOT NULL DEFAULT 0` · timestamps.
 
-### `orders`
-| Column | Type | Constraints |
-|---|---|---|
-| `id` | uuid | PK |
-| `order_reference` | text | NOT NULL, **UNIQUE** |
-| `user_id` | uuid | FK → `auth.users(id)` ON DELETE SET NULL, **nullable (guest checkout)** |
-| `customer_name` | text | NOT NULL |
-| `customer_email` | text | NOT NULL |
-| `phone` | text | nullable |
-| `address` | text | nullable |
-| `city` | text | nullable |
-| `province` | text | nullable |
-| `postal_code` | text | nullable |
-| `gift_note` | text | nullable |
-| `items` | jsonb | NOT NULL, default `'[]'` |
-| `subtotal` | numeric(10,2) | NOT NULL, default 0 |
-| `delivery_fee` | numeric(10,2) | NOT NULL, default 0 |
-| `total` | numeric(10,2) | NOT NULL, default 0 |
-| `status` | order_status | NOT NULL, default `'pending_payment'` |
-| `payment_status` | payment_status | NOT NULL, default `'unpaid'` |
-| `created_at` / `updated_at` | timestamptz | NOT NULL, default `now()` |
+`box_theme_categories`: `box_theme_id uuid FK → box_themes(id) ON DELETE CASCADE` · `category_slug text FK → categories(slug) ON UPDATE CASCADE ON DELETE CASCADE` · `PRIMARY KEY (box_theme_id, category_slug)`.
 
-Indexes: `orders(order_reference)` (unique), `orders(customer_email)`, `orders(created_at desc)`.
+Preserves the four existing assignments exactly (§9). Query for a theme's pool:
+```sql
+select p.* from products p
+join box_theme_categories bt on bt.category_slug = p.category_slug
+where bt.box_theme_id = $1 and p.box_eligible and p.visible and p.stock > 0;
+```
 
-### `store_settings` — singleton row (`id = 1`)
-| Column | Type | Constraints |
-|---|---|---|
-| `id` | int | PK, CHECK `id = 1` (enforces single row) |
-| `delivery_fee` | numeric(10,2) | NOT NULL, default 100 |
-| `store_name` | text | NOT NULL, default `'GEES Convenience Store'` |
-| `slogan` | text | NOT NULL, default `'Everything you didn''t know you needed.'` |
-| `delivery_info` | text | NOT NULL, default `'Standard delivery R100. Estimated delivery up to two weeks within South Africa.'` |
-| `refund_policy` / `privacy_policy` / `terms` | text | NOT NULL, default `''` |
-| `contact_email` | text | NOT NULL, default `'geesconveniencestore01@gmail.com'` |
-| `contact_phone` | text | NOT NULL, default `''` |
-| `payment_link` | text | NOT NULL, default `'https://pay.yoco.com/gees-convenience-store'` |
-| `social_instagram` / `social_facebook` / `social_tiktok` | text | **nullable** (§10C — hidden until real handles exist) |
-| `updated_at` | timestamptz | NOT NULL, default `now()` |
+### 4.5 `orders`
+`id uuid PK` · `order_reference text NOT NULL UNIQUE` · **`public_token uuid NOT NULL UNIQUE DEFAULT gen_random_uuid()`** · `user_id uuid NULL → auth.users(id) ON DELETE SET NULL` · `customer_name`, `customer_email`, `phone`, `address`, `city`, `province`, `postal_code`, `gift_note` · `items jsonb NOT NULL DEFAULT '[]'` · `subtotal`, `delivery_fee`, `total` `numeric(10,2) NOT NULL DEFAULT 0` · `status order_status NOT NULL DEFAULT 'pending_payment'` · `payment_status payment_status NOT NULL DEFAULT 'unpaid'` · **`paid_at timestamptz NULL`** · `created_at`, `updated_at`.
+Indexes: unique `order_reference`, unique `public_token`, `(customer_email)`, `(created_at desc)`.
 
-### `email_settings`
-| Column | Type | Constraints |
-|---|---|---|
-| `id` | uuid | PK |
-| `type` | email_type | NOT NULL, **UNIQUE** |
-| `subject` | text | NOT NULL, default `''` |
-| `html` | text | NOT NULL, default `''` |
-| `enabled` | bool | NOT NULL, default true |
-| `updated_at` | timestamptz | NOT NULL, default `now()` |
+### 4.6 `store_settings` (singleton, `id = 1`)
+`delivery_fee numeric(10,2) NOT NULL DEFAULT 100` · `store_name` · `slogan` · `delivery_info` · `refund_policy` · `privacy_policy` · `terms` · `contact_email` · `contact_phone` · `payment_link` · **`social_instagram`/`social_facebook`/`social_tiktok` `text NULL`** · `updated_at`.
+All defaults verbatim from `wz` (§1). The `social_*` columns are an **additive extension** (the reference hardcodes those links); they exist so links can be shown later without hardcoding, and stay `NULL` → hidden (§0-point 9 of the plan's §10C).
 
-### `email_logs`
-| Column | Type | Constraints |
-|---|---|---|
-| `id` | uuid | PK |
-| `type` | email_type | NOT NULL |
-| `to_email` | text | NOT NULL |
-| `order_reference` | text | nullable (logical link to `orders.order_reference`; not a hard FK) |
-| `status` | email_log_status | NOT NULL |
-| `error` | text | nullable |
-| `attempts` | int | NOT NULL, default 0 |
-| `created_at` | timestamptz | NOT NULL, default `now()` |
+### 4.7 `email_settings`
+`id uuid PK` · `type email_type NOT NULL UNIQUE` · `subject text NOT NULL DEFAULT ''` · `html text NOT NULL DEFAULT ''` · `enabled bool NOT NULL DEFAULT true` · `updated_at`.
+
+### 4.8 `email_logs` (point 5)
+`id uuid PK` · **`order_id uuid NULL → orders(id) ON DELETE SET NULL`** (authoritative link; `NULL` for non-order mail such as `welcome`) · `order_reference text NULL` (display snapshot, survives order deletion) · `type email_type NOT NULL` · `to_email text NOT NULL` · `status email_log_status NOT NULL` · `error text NULL` · `attempts int NOT NULL DEFAULT 0` · `created_at`.
 
 ---
 
 ## 5. Relationships
 
 ```
-auth.users 1───1 profiles
-auth.users 1───0..* orders           (user_id nullable → guest orders)
-categories 1───0..* products         (via category_slug → categories.slug)
-categories.slug  <· ··>  box_themes.categories[]   (logical, array of slugs — validated in app)
-orders.order_reference  <· ··>  email_logs.order_reference   (logical, for admin traceability)
-store_settings  (exactly one row)
-email_settings  (one row per email_type)
+auth.users 1─1 profiles
+auth.users 1─* orders                      (user_id NULL = guest)
+categories 1─* products                    (products.category_slug → categories.slug, UNIQUE)
+box_themes *─* categories                  (via box_theme_categories)
+orders 1─* email_logs                      (email_logs.order_id, NULL for welcome)
+store_settings (single row)   ·   email_settings (one row per email_type)
 ```
 
 ---
 
-## 6. Functions & triggers
+## 6. Server-side order creation & validation (point 3)
 
-| Object | Purpose |
-|---|---|
-| `public.set_updated_at()` | BEFORE UPDATE trigger → `new.updated_at = now()` (all tables with `updated_at`) |
-| `public.handle_new_user()` | AFTER INSERT ON `auth.users` → create `profiles` row with `role='customer'`, `full_name` from metadata. `SECURITY DEFINER`, `search_path=''` |
-| `public.prevent_role_escalation()` | BEFORE UPDATE ON `profiles` → raise if `role` changes and `auth.role() <> 'service_role'` (blocks clients promoting themselves; the service-role script may promote) |
-| `public.is_admin()` | `STABLE SECURITY DEFINER` → `exists(select 1 from profiles where id = auth.uid() and role='admin')`; used by write policies |
+**No client `INSERT` on `orders`.** The policy is revoked for `anon`/`authenticated`; the only path is:
 
-`order_reference` is **generated server-side** (never client-supplied). Its exact format is preserved
-from the reference and will be confirmed from the bundle during the checkout stage — flagged in §12.
+```sql
+create function public.create_order(payload jsonb) returns jsonb
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare v_fee numeric; v_sub numeric(10,2) := 0; it jsonb; v_line jsonb; ...
+begin
+  select delivery_fee into v_fee from store_settings where id = 1;   -- fee: server-side only
+
+  for it in select * from jsonb_array_elements(payload->'items') loop
+    v_line := public.resolve_line(it);      -- looks up products by id
+    v_sub  := v_sub + (v_line->>'line_total')::numeric;   -- prices from DB, NOT the client
+  end loop;
+
+  insert into orders (
+    order_reference,
+    user_id,                                -- = auth.uid() when signed in, else NULL
+    customer_name, customer_email, phone, address, city, province, postal_code, gift_note,
+    items, subtotal, delivery_fee, total,
+    status, payment_status                  -- forced
+  ) values (
+    public.next_order_reference(),
+    auth.uid(),
+    payload->>'customer_name', payload->>'customer_email', ...,
+    v_sub, v_fee, v_sub + v_fee,
+    'pending_payment', 'unpaid'
+  ) returning id, order_reference, public_token, total into ...;
+
+  return jsonb_build_object('order_reference', ..., 'public_token', ..., 'total', ...);
+end $$;
+```
+
+Guarantees:
+- **Prices/subtotal** come from `products` (`COALESCE(sale_price, price)`) — client-supplied prices are ignored.
+- **Delivery fee** comes from `store_settings` — not client-supplied.
+- **Total** = `subtotal + delivery_fee`, computed in the function.
+- **Ownership**: `user_id` is set from `auth.uid()` only; the client cannot choose it.
+- **Payment state**: `status`/`payment_status` are literals inside the function; unreachable from the client.
+- `revoke all on function public.create_order(jsonb) from public; grant execute … to anon, authenticated;`
+
+**Open dependency:** Build-a-Box line pricing (pack sizes **5 / 10 / 15**) and any free-delivery threshold must be confirmed from the reference before the checkout stage; `resolve_line` will encapsulate that rule. Until then it handles normal items only. See §16.
 
 ---
 
-## 7. RLS policy plan
+## 7. Guest confirmation & retrieval (point 4)
 
-RLS **enabled on every table**. `anon`/`authenticated` get only what is listed; everything else is
-denied by default. The service role bypasses RLS (server-side only).
+- Every order gets a random `public_token` (122-bit UUID). `order_reference` stays as the human/payment-matching reference only.
+- **Creation response** returns `order_reference`, `public_token`, `total` → the confirmation screen renders from this; no `SELECT` needed.
+- **Later retrieval** (e.g. reopening the confirmation link) uses:
+  ```sql
+  create function public.get_order_by_token(p_token uuid) returns jsonb
+  language sql stable security definer set search_path = public as $$
+    select to_jsonb(o) - 'user_id' from orders o where o.public_token = p_token;
+  $$;
+  ```
+  `security definer` + token match only; returns a **whitelisted** projection (no `user_id`, no other customers' rows). Tokens are not enumerable.
+- Signed-in customers additionally have the RLS `SELECT` (owner-or-admin) path.
 
-| Table | Role | SELECT | INSERT | UPDATE | DELETE |
+---
+
+## 8. Payments (point 7)
+
+- `payment_status` starts `unpaid` and is **never** settable by the client (no INSERT policy; not a parameter of `create_order`).
+- The Yoco redirect/return is treated as **informational only** — it does not set `paid`. The return page may *show* "awaiting payment confirmation".
+- `paid` is only ever written server-side by the service-role client: by an admin action (Admin → Orders) and, in future, by a Yoco webhook/verification call. `paid_at` records when verification happened.
+- `failed` remains available for a rejected/failed payment recorded server-side.
+
+---
+
+## 9. Order references (point 8)
+
+**Confirmed:** `order_reference` is produced by a Base44 **backend function**; the client receives it read-only. The rule is not present in the public bundle, and no literal `gees<number>` exists in it.
+
+**Proposed reproduction of the observed format** (`gees1007`, `gees1008` = prefix `gees` + a 4-digit sequential number):
+- A dedicated Postgres sequence `order_reference_seq`; `next_order_reference()` = `'gees' || nextval('order_reference_seq')`.
+- Sequence initialised to `max(numeric suffix of existing references) + 1`, i.e. continuing the live series; default **1001** if the table is empty.
+- A sequence (not `count+1`) guarantees uniqueness under concurrent checkout.
+- Uniqueness enforced by `UNIQUE(order_reference)`.
+
+**Still to confirm before checkout development (see §16):** the exact starting number and step. Please supply either a few real references (e.g. the gees1007/1008 values seen in production) **or** the Base44 backend function source, so the sequence can be seeded identically. I will not invent a starting point.
+
+---
+
+## 10. Email templates & logs (point 9)
+
+**Confirmed:** the reference's template copy is stored in the `EmailSetting` table (`subject`, `html`) and rendered by a backend function; the public table is **empty (0 rows)**, and no default copy exists in the client bundle.
+
+Therefore:
+- If the owner can export the `EmailSetting` rows (or the backend's default copy), we seed them **verbatim** — zero rewriting.
+- Until then, `email_settings` rows are seeded with `subject = ''`, `html = ''`, which is exactly the reference's own fallback behaviour when unset.
+- `email_logs` uses `order_id` as the authoritative link (§4.8), with `status` ∈ `sent|failed|skipped`; the dev transport records `skipped` so development needs no subscription.
+
+---
+
+## 11. Admin security (point 6)
+
+- **`role` is never derived from user-editable data.** `auth.users.raw_user_meta_data` is user-writable, so `handle_new_user()` hardcodes `role = 'customer'` and only copies `full_name` (a display value) from metadata.
+- `profiles` has **no client `INSERT`/`DELETE`** policy; rows are created solely by the signup trigger (`ON CONFLICT (id) DO NOTHING`).
+- `prevent_role_escalation()` (BEFORE UPDATE) raises unless `auth.role() = 'service_role'` **and** `role` changed — so neither the owner nor any client can self-promote; only the server/service-role script can.
+- `profiles` UPDATE policy is `USING (id = auth.uid()) WITH CHECK (id = auth.uid())` — a user may edit only their own row and cannot reassign `id`.
+- `is_admin()` is `STABLE SECURITY DEFINER` reading `profiles` (never JWT claims); used by every admin write policy.
+- Admin UI access is re-checked server-side per request (§10E of the plan); the service-role key stays server-only.
+
+---
+
+## 12. RLS policy plan (revised)
+
+RLS enabled on **every** table; default deny. The service role bypasses RLS (server-side only).
+
+| Table | anon SELECT | authenticated SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|---|
-| `products` | anon, authenticated | ✅ `true` | admin | admin | admin |
-| `categories` | anon, authenticated | ✅ `true` | admin | admin | admin |
-| `box_themes` | anon, authenticated | ✅ `true` | admin | admin | admin |
-| `store_settings` | anon, authenticated | ✅ `true` | admin | admin | admin |
-| `orders` | anon | ❌ | ✅ **with check** `status='pending_payment' AND payment_status='unpaid'` | ❌ | ❌ |
-| `orders` | authenticated | ✅ `customer_email = auth.jwt()->>'email' OR is_admin()` | ✅ (same check as anon) | admin | admin |
-| `profiles` | authenticated | ✅ `id = auth.uid() OR is_admin()` | ❌ (created by trigger) | ✅ `id = auth.uid()` **+ role-escalation trigger** | ❌ |
-| `email_settings` | authenticated | admin | admin | admin | admin |
-| `email_logs` | authenticated | admin | ❌ (server writes via service role) | admin | admin |
+| `products` | ✅ true | ✅ true | admin | admin | admin |
+| `categories` | ✅ true | ✅ true | admin | admin | admin |
+| `box_themes` | ✅ true | ✅ true | admin | admin | admin |
+| `box_theme_categories` | ✅ true | ✅ true | admin | admin | admin |
+| `store_settings` | ✅ true | ✅ true | admin | admin | admin |
+| `orders` | ❌ | ✅ `customer_email = auth.jwt()->>'email' OR is_admin()` | **❌ (revoked — only `create_order`)** | admin | admin |
+| `profiles` | ❌ | ✅ `id = auth.uid() OR is_admin()` | ❌ | ✅ `id = auth.uid()` + role trigger | ❌ |
+| `email_settings` | ❌ | admin | admin | admin | admin |
+| `email_logs` | ❌ | admin | ❌ (server writes) | admin | admin |
 
-Notes:
-- **Guests cannot read orders** (no session). The confirmation/result step uses the row returned by the
-  server-side insert, and delivery of history is via the confirmation email — same behaviour as the reference.
-- **Clients cannot choose `status`/`payment_status`** on insert (policy `WITH CHECK`), so nobody can
-  self-mark an order as paid. Totals are recomputed server-side.
-- **`store_settings.social_*`** are public to read but the UI hides them when null (§10C).
-- Admin `SELECT` on orders reads through the **server** client (service role) per §10E; the RLS admin
-  clause exists as a defence-in-depth backstop.
+Function grants: `create_order` and `get_order_by_token` → `EXECUTE` to `anon, authenticated`; all `SECURITY DEFINER` functions pinned with `set search_path`.
 
 ---
 
-## 8. Migration sequence (additive, each with a documented DOWN)
+## 13. Migration sequence (point 10)
 
-| # | File | Up | Down (rollback) |
+Versioned Supabase CLI migrations under `supabase/migrations/`, each with a **separate, independently reviewed** rollback under `supabase/rollback/`.
+
+| Ver | Migration | Rollback (separate file, reviewed) |
+|---|---|---|
+| 0000 | extensions + `set_updated_at()` + `is_admin()` | drop functions |
+| 0001 | 5 enum types | drop enum types |
+| 0002 | `profiles` + `handle_new_user()` + `prevent_role_escalation()` + triggers | drop triggers/functions + table |
+| 0003 | `categories` (+ unique slug) + RLS | drop table |
+| 0004 | `box_themes` + `box_theme_categories` + RLS | drop tables (child first) |
+| 0005 | `products` + FK + indexes + RLS | drop table |
+| 0006 | `orders` + `public_token` + `order_reference_seq` + `next_order_reference()` + RLS | drop table/sequence/functions |
+| 0007 | `store_settings` + RLS | drop table |
+| 0008 | `email_settings` + `email_logs` (+ `order_id` FK) + RLS | drop tables |
+| 0009 | `create_order()` + `get_order_by_token()` + grants | drop functions |
+| 0010 | seed: 5 categories, 4 box themes, 4 theme-category links, 25 products | delete seeded rows |
+| 0011 | seed: `store_settings` singleton (+ null social columns) | delete row |
+| 0012 | seed: `email_settings` rows (empty copy pending owner export) | delete rows |
+
+Applied via `supabase db push` / `migration up`. Rollbacks are executed explicitly by filename — never as inline comments. Storage buckets (`product-images`, `brand`) remain **out of Stage 3**.
+
+---
+
+## 14. Backup options — document before recommending an upgrade (point 11)
+
+Supabase's backup features depend on plan tier (verify against Supabase's current pricing/docs, as these change):
+
+| Tier | Automated backups | PITR | Notes |
 |---|---|---|---|
-| 0000 | `0000_helpers.sql` | `pgcrypto` (if needed), `set_updated_at()`, `is_admin()` | drop the two functions |
-| 0001 | `0001_enums.sql` | create the 5 enum types (guarded `IF NOT EXISTS`) | drop the 5 types |
-| 0002 | `0002_profiles.sql` | `profiles` table + RLS + `handle_new_user()` + `prevent_role_escalation()` + updated_at trigger | drop triggers/functions then table |
-| 0003 | `0003_catalog.sql` | `categories`, `box_themes`, `products` + FKs + indexes + RLS + updated_at triggers | drop tables (children first) |
-| 0004 | `0004_orders.sql` | `orders` + indexes + RLS + updated_at trigger | drop table |
-| 0005 | `0005_store_settings.sql` | `store_settings` + RLS + seed singleton row (`insert … on conflict do nothing`) | `delete from store_settings`; drop table |
-| 0006 | `0006_email.sql` | `email_settings`, `email_logs` + RLS | drop tables |
-| 0007 | `0007_seed_catalog.sql` | seed **5 categories**, **4 box themes**, **25 products** from the captured snapshot (idempotent upsert by natural key) | delete seeded rows by slug/name |
-| 0008 | `0008_seed_email_templates.sql` | seed one `email_settings` row per `email_type` with the reference's default copy (empty until the owner supplies text) | delete rows |
+| **Free** | ❌ none | ❌ | Project can be paused after inactivity; restore relies on manual dumps |
+| **Pro** (paid) | ✅ daily backups, limited retention | ➕ paid add-on | Retention/PITR window varies |
+| Team / Enterprise (paid) | ✅ longer retention | ➕ | — |
 
-Applied with the Supabase CLI (`supabase migration up`) or `psql -f`. Every file is re-runnable where
-practical (`create … if not exists`, `on conflict do nothing`).
+**Recommendation for now: do NOT upgrade.** Regardless of tier, and until you tell me which tier the project is on, the migration uses an interim process that needs no paid feature:
+1. `supabase db dump --schema public` (schema) + `--data-only` (data) → saved **outside git** (owner storage) before the first seed and after each migration.
+2. All migrations + rollbacks versioned in git → the schema is fully reproducible.
+3. Immutable Base44 source snapshot (products/categories/themes) committed under `migration/source-snapshot/` → seed data is reproducible.
+4. `.env.local`/Vercel env values kept in the owner's password manager.
 
-**Storage buckets are intentionally NOT part of Stage 3** — `product-images` and `brand` are created in
-the asset-migration stage (§6.1), after approval.
+**Please confirm** your current tier (Free or Pro) so I can state the exact automated-backup position; an upgrade is only worth discussing if you want automated daily backups or PITR.
 
 ---
 
-## 9. Seed data (from the captured, verbatim snapshot)
+## 15. Verification (after applying)
 
-- 5 categories: Gifts `gifts`, Books & Stationery `books-stationery`, Home `home`, Beauty `beauty`, Accessories `accessories` (sort order 1–5)
-- 4 box themes: Shine On `[accessories,beauty]`, Cosy Home `[home]`, Desk & Dream `[books-stationery]`, Self-Care Sunday `[beauty,gifts]`
-- 25 products with the captured name/description/price/category/image_url/stock/is_new/is_trending/box_eligible
-  (price range R69–R624, 21 box-eligible, 1 out of stock)
-- `store_settings` singleton with the reference defaults
-- `email_settings`: one row per type (subject/html empty pending owner copy)
-
-Source: `migration/source-snapshot/` (immutable v1 export, committed separately in the migration stage).
+`scripts/verify-schema.ts`: 9 tables exist with RLS enabled; 5 enums with exact values; expected policy set; seed counts (`categories=5`, `box_themes=4`, `box_theme_categories=7` links across the 4 themes, `products=25`, `store_settings=1`); **negative tests with the anon key**: cannot `INSERT` an order directly, cannot set `status='paid'`, cannot change own `profiles.role`, cannot read another email's orders; `create_order` ignores client-supplied prices (totals recomputed); duplicate `order_reference` rejected; no `media.base44.com` strings in rows.
 
 ---
 
-## 10. Verification (to run after applying)
+## 16. Decisions / inputs needed before implementation
 
-`scripts/verify-schema.ts` asserts:
-1. All 8 tables exist; **RLS enabled** on each.
-2. All 5 enums exist with the exact value sets in §3.
-3. Expected policy set present (count + names per table).
-4. Seed counts: `categories = 5`, `box_themes = 4`, `products = 25`, `store_settings = 1`.
-5. Negative tests with the **anon** key: `orders` SELECT returns nothing; a client cannot set
-   `status='paid'` on insert; a client cannot change its own `profiles.role`.
-6. No `media.base44.com` strings in DB rows.
-
----
-
-## 11. Rollback strategy
-
-- Apply order is child-last on teardown; each migration's `-- DOWN` block reverses exactly its objects.
-- Because the schema + seed are reproducible from the snapshot, a full rollback = drop `public` objects
-  (or a fresh project) and re-run migrations.
-- `supabase db dump` (schema + data) captured before the first seed and after each migration (§6.3).
-
----
-
-## 12. Decisions needing your review / confirmation
-
-1. **`products.category_slug` FK vs `category_id` uuid** — proposed: keep the reference's **slug** FK
-   (faithful, minimal transformation). Alternative: uuid `category_id` + unique slug.
-2. **`box_themes.categories` as `text[]`** (reference shape) vs a join table. Proposed: `text[]`, validated in app + verify script.
-3. **`order_reference` format** — generated server-side; exact pattern to be confirmed from the bundle before the checkout stage.
-4. **`payment_status = 'failed'`** — kept in the enum (reference has it); confirm how/when it is set (Yoco has no callback in the current flow).
-5. **Email template defaults** — seed with empty subject/html (owner supplies), or capture the reference's built-in copy?
-6. **Supabase plan tier** — affects PITR vs scheduled backups (§6.3).
-7. **Apply method** — Supabase CLI (`supabase link` + `migration up`) vs pasted SQL in the dashboard. CLI is preferred (versioned in git); it requires linking the project locally.
+1. **Build-a-Box pricing rule** (pack sizes 5/10/15) and any free-delivery threshold — required for `resolve_line`.
+2. **Order-reference samples or backend function source** — to seed the sequence identically (§9).
+3. **`EmailSetting` export** (or the backend's default copy) — to preserve template copy verbatim (§10).
+4. **Category delete behaviour** — proposed `ON DELETE SET NULL`; confirm or choose `RESTRICT`.
+5. **`payment_status='failed'`** — confirm it is ever used, and by what (nothing in the current flow sets it).
+6. **Stock decrement on order** — does the reference reduce `products.stock` when an order is placed? (Not observed in the bundle.)
+7. **Supabase tier** (Free/Pro) for the backup statement (§14).
+8. **Apply method** — CLI migrations (preferred, versioned) vs dashboard SQL.
