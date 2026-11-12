@@ -14,7 +14,7 @@ Each stage is implemented, tested and committed separately. The Base44 site stay
 |---|---|---|
 | 1 | Project foundation & configuration (Next.js + TS + Tailwind, design tokens, fonts, env template, lint/build) | ✅ complete |
 | 2 | Supabase connection setup (SSR clients, `proxy.ts` session refresh, env template) — no schema/data yet | ✅ complete |
-| 3 | Supabase schema, RLS, migrations, seed + verification script | pending |
+| 3 | Supabase schema, RLS, migrations, seed + verification script | 📝 plan ready for review (docs/STAGE3_SUPABASE_SCHEMA.md) |
 | 4 | Layout shell: header (nav + search), footer, announcement bar, cart provider/drawer skeleton, UI primitives | pending |
 | 5 | Home page (hero, promise, categories, New In, experience, delivery, refund) | pending |
 | 6 | Shop (filters/sort) + product detail + header search results | pending |
