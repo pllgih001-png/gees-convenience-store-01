@@ -1,8 +1,17 @@
-# Stage 3 — Supabase schema, RLS & migration plan (FINAL v6 — GUEST-SESSION BOUNDARY, FOR APPROVAL)
+# Stage 3 — Supabase schema, RLS & migration plan (FINAL v7 — CSRF DELIVERY + OWNER-SCOPED IDEMPOTENCY, FOR APPROVAL)
 
 Status: **proposed — not applied.** No database objects created. No credentials used or committed. Base44 site untouched.
-Supersedes v1–v5. Awaiting **separate explicit approval** before implementation.
-v5 recorded the owner's decisions; v6 closes the guest-session security boundary (§24) with HMAC-expiry cookies, CSRF protection, a non-deprecated service-role check, and rotation-safe idempotency.
+Supersedes v1–v6. Awaiting **separate explicit approval** before implementation.
+v6 closed the guest-session boundary (§24); v7 fixes CSRF token delivery without exposing the HttpOnly guest cookie, and removes owner-independent deduplication in favour of owner/key identity preserved across renewal (§24.2, §24.4).
+
+---
+
+## 0e. What changed in v7 (mapped to your two issues)
+
+| # | Your issue | v7 response |
+|---|---|---|
+| 1 | CSRF token delivery vs an HttpOnly cookie | ✅ The `gees_guest` identity cookie **stays HttpOnly**. The CSRF token is **derived server-side from the session and rendered into the form** — no cookie needs to be JS-readable, so nothing is exposed (§24.2). |
+| 2 | Owner-independent dedupe (`email + payload_hash + 60s`) | ✅ **Removed.** Identity is `(idempotency_owner, idempotency_key)` only. The owner is **preserved across renewal** (same `sid`) and across controlled invalidation (grace window), so a genuine retry returns the original order — and two distinct sessions with identical details create **two** orders (§24.4). |
 
 ---
 
@@ -11,9 +20,9 @@ v5 recorded the owner's decisions; v6 closes the guest-session security boundary
 | # | Your requirement | v6 response |
 |---|---|---|
 | 1 | HMAC expiry protection | ✅ The signed payload now carries `exp`; the server verifies signature **and** expiry, so an old cookie cannot be replayed (§24.1). |
-| 2 | CSRF beyond `SameSite=Lax` | ✅ Route Handler enforces **Origin/`Sec-Fetch-Site` validation + a double-submit CSRF token + POST-only** (§24.2). |
+| 2 | CSRF beyond `SameSite=Lax` | ✅ Route Handler enforces **Origin/`Sec-Fetch-Site` validation + a server-derived CSRF token (rendered into the form) + POST-only**; the identity cookie stays HttpOnly (§24.2). |
 | 3 | `auth.role()` deprecation | ✅ Replaced with the current recommended claim check `(auth.jwt() ->> 'role')` (with the underlying `request.jwt.claims` noted) (§24.3). |
-| 4 | Rotation-safe idempotency | ✅ **Renewal** (same `sid`, extended `exp`) vs **invalidation** (new `sid`); a new `sid` is never issued mid-checkout, and a payload-hash dedupe window backstops any post-rotation retry (§24.4). |
+| 4 | Rotation-safe idempotency | ✅ **Renewal** (same `sid`, extended `exp`) vs **invalidation** (new `sid`); a new `sid` is never issued mid-checkout, and a signed **grace cookie** preserves the same owner so a retry resolves to the original order — no email/payload fallback (§24.4). |
 | 5 | Revised SQL signature, grants, flow, tests | ✅ §6.1, §6.3, §24.5, §15/§24.6. |
 
 ---
@@ -570,7 +579,7 @@ All validation happens **inside `create_order()`** (and a thin API route that ne
 | payload size | Whole JSON payload **≤ 64 KB**, enforced in the RPC and the API route. |
 | price / delivery_fee / total | **Never accepted from the client** — recomputed from `products` + `store_settings`. |
 
-**Duplicate-submission protection:** the checkout form generates an `idempotency_key uuid`. `create_order()` performs a scoped `INSERT … ON CONFLICT (idempotency_owner, idempotency_key) DO NOTHING`; a repeated POST / double-click therefore yields one order. Additionally: per-IP rate limiting on the API route (N7) and a soft dedupe on `(customer_email, items-hash, created_at < 60s)`.
+**Duplicate-submission protection:** the checkout form generates an `idempotency_key uuid`. `create_order()` performs a scoped `INSERT … ON CONFLICT (idempotency_owner, idempotency_key) DO NOTHING`; a repeated POST / double-click therefore yields one order. Per-IP rate limiting on the API route (N7) provides abuse protection. **There is no owner-independent dedupe** (see §24.4): identity is `(idempotency_owner, idempotency_key)` only, so two different sessions that happen to share an email or an identical basket still create two separate orders.
 
 ### 17.1 Idempotency-key security (v5 correction)
 An idempotency key is **never a global handle** — it is scoped, payload-bound and authorisation-checked:
@@ -735,7 +744,7 @@ Each rollback file states its **preconditions** (dependent objects already remov
 - [ ] guest-retrieval whitelist tests pass (**E**)
 - [ ] concurrency + lifecycle tests pass (**F**)
 - [ ] payments: redirect cannot set `paid`; duplicate/invalid-signature events are no-ops (**G**)
-- [ ] guest-boundary tests pass: forged-owner refusal, HMAC/expiry tamper, CSRF 403, rotation safety, cross-guest isolation (§24.6)
+- [ ] guest-boundary tests pass: **T1** two sessions → two identical orders, **T2** same-session retry → original order, **T3** renewal keeps idempotency, **T4** invalidation does not expose another guest's order, **T5** CSRF works with the identity cookie HttpOnly; plus forged-owner refusal, HMAC/expiry tamper (§24.6)
 - [ ] rollback drill `0012 → 0000` succeeds on a throwaway DB (**H**)
 
 **Env / config (server-only, no secrets committed)**
@@ -764,14 +773,17 @@ Cookie `gees_guest`, value `"<payload>.<sig>"` where:
 
 **Server validation (every use):** recompute the HMAC and compare with a **timing-safe** equality; then require `iat ≤ now < exp`. If the signature is invalid, or `exp` has passed, the cookie is **rejected and replaced** — an old cookie **cannot be replayed indefinitely**. `GUEST_SESSION_SECRET` is server-only (never a `NEXT_PUBLIC_*` var, never sent to the browser).
 
-### 24.2 CSRF protection (point 2)
-`SameSite=Lax` is **not** the only control. The checkout Route Handler additionally requires, on every POST:
-1. **Origin check** — `Origin` (or `Referer` when `Origin` is absent) must equal the app's canonical origin; `Sec-Fetch-Site` must be `same-origin`. Otherwise **403**.
-2. **Double-submit CSRF token** — a random `csrf` token is issued alongside the guest cookie (its own `HttpOnly` cookie **and** embedded in the checkout form). On POST, the form field must match the cookie value (timing-safe compare). A cross-site page cannot read the cookie, so it cannot forge the field.
-3. **POST-only** — non-POST methods are rejected.
-4. **Idempotency** — a replayed POST is additionally absorbed by the idempotency key (§17).
+### 24.2 CSRF protection (point 2) — without exposing the identity cookie
+`SameSite=Lax` is **not** the only control. The `gees_guest` identity cookie stays **HttpOnly**; the CSRF token never needs to be readable by JavaScript. The token is **derived server-side from the session and delivered inside the server-rendered form**:
 
-No state-changing operation is exposed via GET. The CSRF token is bound to the guest session and rotated with it (§24.4).
+1. **Token derivation** — on rendering the checkout page the server computes `csrf = base64url(HMAC‑SHA256("csrf:" + sid, GUEST_SESSION_SECRET))`. Because it is keyed by the (server-only) `sid`, the server can **recompute** it at validation time without storing anything and without a second cookie. `sid` is passed only via the HttpOnly `gees_guest` cookie.
+2. **Delivery** — the token is written into a hidden form field `<input type="hidden" name="csrf" value="…">` in the **server-rendered** HTML. No JS read of any cookie is required, so the identity cookie can remain HttpOnly. (If a client-rendered/SDK submit path is ever needed, the fallback is a **separate** cookie explicitly set `HttpOnly=false` holding only the CSRF value — never the guest identity — but the server-rendered field is the default.)
+3. **Validation** — on POST the Route Handler re-reads `sid` from the HttpOnly cookie, recomputes the expected `csrf`, and compares with the submitted field using a **timing-safe** equality. Mismatch or missing → **403**, no order created.
+4. **Origin check** — `Origin` (or `Referer` when absent) must equal the app's canonical origin and `Sec-Fetch-Site` must be `same-origin`; otherwise **403** (defence in depth, independent of the token).
+5. **POST-only** — non-POST methods are rejected.
+6. **Idempotency** — a replayed POST is additionally absorbed by the idempotency key (§17).
+
+No state-changing operation is exposed via GET. The CSRF token is bound to the session and rotates with it (§24.4) automatically, because it is derived from `sid`.
 
 ### 24.3 Supabase role validation — not `auth.role()` (point 3)
 `auth.role()` is deprecated. The function uses the **current recommended claim check** instead:
@@ -789,16 +801,19 @@ Two distinct operations, deliberately separated:
 - **Renewal** — extend `exp` while keeping the **same `sid`**. Safe at any time: the owner (`hash(sid)`) is unchanged, so an in-progress or repeated checkout still maps to the same `(idempotency_owner, idempotency_key)` and returns the same order. Renewal is the default.
 - **Invalidation** — issue a **new `sid`**. Only on: sign-in (guest retired in favour of `auth.uid()`), explicit logout/clear, or suspected abuse. **Never issued while a checkout request is in flight, and not until after a successful order has been fully acknowledged.**
 
-Because a new `sid` changes the owner, a post-rotation retry with the same key would otherwise look like a new order. Two guards prevent a duplicate:
-1. **Grace window** — after invalidation the previous signed cookie is still accepted (same owner) for a short overlap, so a late retry lands on the same owner.
-2. **Payload-hash dedupe** — `(customer_email, idempotency_payload_hash, created_at < 60s)` is checked independently of the owner; an identical recent order is returned instead of created.
+Because a new `sid` changes the owner, a post-invalidation retry with the same key must not become a second order. The mechanism is **owner preservation**, never payload/email similarity:
 
-Net effect: rotation cannot invalidate an in-progress order, cannot break a repeat request, and idempotency stays reliable.
+1. **Renewal keeps the owner.** The common case — extending the session — keeps the **same `sid`**, so `(idempotency_owner, idempotency_key)` is unchanged and a retry returns the **same** order. This is the default and needs no grace.
+2. **Controlled invalidation keeps the owner via a signed grace cookie.** When a new `sid` is issued (sign-in, logout, abuse), the server also sets a short-lived, signed **grace cookie** carrying the **previous** owner. The Route Handler resolves the owner in order: current `sid` → else grace cookie. So a retry that started before invalidation still maps to the original owner and returns the original order, until the grace cookie expires.
+3. **Identity, not similarity.** There is **no** owner-independent dedupe on `(customer_email, payload_hash, …)`. Two different sessions (different owners) with the *same* email and an *identical* basket therefore produce **two separate orders** — correct behaviour. `idempotency_payload_hash` is retained **only** to detect misuse of one key by one owner (`same owner + same key + different payload → reject`, §17.1); it is never used to collapse orders across owners.
+4. **After the grace window.** Once the grace cookie has expired, a resubmission is a genuinely new session and creates a new order — the client is expected to retain its `idempotency_key` per attempt and to disable resubmission while a request is in flight, so this case is a last resort, not the happy path.
+
+Net effect: identity (owner + key) is the sole dedupe key; renewal and controlled invalidation preserve the owner; two distinct customers never collapse into one order.
 
 ### 24.5 Proposed request flow
 ```
 Browser ──POST /api/checkout──► Route Handler (server-only)
-  1. Origin / Sec-Fetch-Site check + CSRF token match (double-submit)     → else 403
+  1. Origin / Sec-Fetch-Site check + server-derived CSRF token match      → else 403
   2. Resolve identity server-side:
        signed-in?  → createClient() [user JWT]         → auth.uid() branch
        else        → read gees_guest cookie → verify HMAC + exp → validated sid
@@ -809,12 +824,14 @@ Browser ──POST /api/checkout──► Route Handler (server-only)
 ```
 Files: existing [server.ts](file:///workspace/src/lib/supabase/server.ts) (signed-in), [admin.ts](file:///workspace/src/lib/supabase/admin.ts) (guest, service-role, server-only); **to create** `src/lib/guest/session.ts` (`getOrCreateGuestId`, `verifyGuestCookie`, `rotateGuestId`, `clearGuestId`) and `src/app/api/checkout/route.ts`; **new env** `GUEST_SESSION_SECRET`.
 
-### 24.6 Additional security test cases (guest boundary)
+### 24.6 Security test cases (guest boundary) — with expected results
+- [ ] **T1 · Two different guest sessions, identical orders.** Guest A and guest B each create an order with the **same email and an identical basket** (different owners, different keys; each with a fresh cookie jar). **Expected:** **two distinct order rows**, two distinct `order_reference`/`public_token`; neither returns the other's order. (Proves no owner-independent dedupe.)
+- [ ] **T2 · Retry from the same session returns the original order.** Same guest, same `idempotency_key`, POSTed twice (double-click). **Expected:** **one** order; both responses carry the identical `order_reference`/`public_token`.
+- [ ] **T3 · Session renewal does not break idempotency.** Renew the cookie (`exp` extended, **same `sid`**), then repeat the POST with the same key. **Expected:** **one** order; the retry returns the original; owner hash unchanged.
+- [ ] **T4 · Invalidation does not let another guest retrieve an existing order.** Guest A orders (token TA). Guest B obtains A's `idempotency_key` and replays it, and also tries `get_order_by_token(TA)`. **Expected:** B's replay creates **B's own** order (different owner) and never returns A's; `get_order_by_token(TA)` from B is a normal token check — B cannot reach A's order except by presenting TA, which B does not legitimately hold. After A's session is invalidated, A's retry within the grace window still resolves to A's original order; **B still cannot**.
+- [ ] **T5 · CSRF without exposing the HttpOnly identity.** Confirm the `gees_guest` cookie is `HttpOnly` (JS cannot read it); submit with a **wrong/absent** `csrf` field or a mismatched `Origin` → **403**, no order. Submit with the correct server-rendered token → **one** order. Also assert `document.cookie` never contains the guest identity.
 - [ ] **Forged guest owner** — call `create_order` with the **anon** key and a `p_guest_owner` → assert `42501 guest_checkout_requires_server` (nothing inserted).
 - [ ] **Service-role path** — call via the server route → assert the order is created with `idempotency_owner` = the server-derived hash, not any client value.
 - [ ] **HMAC tamper** — flip a byte of the cookie payload, or change `exp` → assert the server rejects and reissues.
 - [ ] **Expired cookie replay** — present a validly-signed cookie whose `exp` is in the past → assert rejection (`exp` is inside the signed payload).
-- [ ] **CSRF** — POST with a missing/`Origin`-mismatched header, or a wrong CSRF field → assert **403**, no order created.
-- [ ] **Rotation safety** — mid-checkout renewal (same `sid`) → same order on retry; after a completed order, invalidate then retry with the same key within the grace window → still one order.
-- [ ] **Cross-guest isolation** — guest B replays guest A's `idempotency_key` → different owner → separate row; B cannot read A's order or token.
 - [ ] **Claim check** — confirm no function references the deprecated `auth.role()` (grep the migration SQL).
