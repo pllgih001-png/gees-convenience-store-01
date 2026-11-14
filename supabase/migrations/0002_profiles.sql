@@ -114,3 +114,9 @@ create policy profiles_update_own on public.profiles
   with check (id = auth.uid());
 
 grant select, update on public.profiles to authenticated;
+
+-- service_role (trusted server role, server-only): the approved server-side
+-- role-provisioning flow (§11) reads a profile and EXTENDS/CHANGES its role.
+-- Hosted Supabase no longer grants default privileges on new public objects
+-- (enforced 2026-10-30), so this is stated explicitly (A2-1).
+grant select, update on public.profiles to service_role;

@@ -173,7 +173,7 @@ Effective price = `COALESCE(sale_price, price)` — matches the reference's stri
 
 `box_theme_categories`: `box_theme_id uuid FK → box_themes(id) ON DELETE CASCADE` · `category_slug text FK → categories(slug) ON UPDATE CASCADE ON DELETE CASCADE` · `PRIMARY KEY (box_theme_id, category_slug)`.
 
-Preserves the four existing assignments exactly (§9). Query for a theme's pool:
+Preserves the **six** existing assignments exactly (§9; verified against the Base44 `BoxTheme` source: Shine On→[accessories,beauty], Cosy Home→[home], Desk & Dream→[books-stationery], Self-Care Sunday→[beauty,gifts]). Query for a theme's pool:
 ```sql
 select p.* from products p
 join box_theme_categories bt on bt.category_slug = p.category_slug
@@ -312,6 +312,7 @@ Every `SECURITY DEFINER` function (`create_order`, `get_order_by_token`, `next_o
 1. **Revoke the implicit PUBLIC grant** first: `revoke all on function public.<fn>(<args>) from public;` — and **from `anon`** on `create_order` specifically.
 2. **Grant only to intended roles** — least privilege:
    - `create_order(jsonb, uuid, text)` → `grant execute … to authenticated, service_role;` **never `anon`** (guest checkout goes through the server route, §24.3).
+   - `settle_order(uuid, payment_status, text)` → `grant execute … to service_role;` **only** — **never `anon` or `authenticated`**. Settlement is the server-side payment boundary (§18/§20): the server verifies the gateway outcome and settles with the service-role key; no browser session settles directly (A2-2).
    - `get_order_by_token(uuid)` → `grant execute … to anon, authenticated;` (unguessable token + field whitelist, §7).
    - `release_expired_reservations()` → `grant execute … to authenticated;` (body is idempotent; no admin check needed)
    - `reassign_products_category(text, text)` → `grant execute … to authenticated;` with an **internal `is_admin()` check** (never granted to `anon`)
@@ -461,7 +462,7 @@ Versioned Supabase CLI migrations under `supabase/migrations/`, each with a **se
 | 0007 | `store_settings` + RLS | drop table |
 | 0008 | `email_settings` + `email_logs` (+ `order_id` FK) + RLS | drop tables |
 | 0009 | `create_order()`, `get_order_by_token()`, `settle_order()`, `release_expired_reservations()`, `reassign_products_category()` + grants/hardening | drop functions |
-| 0010 | seed: 5 categories, 4 box themes, 4 theme-category links, 25 products | delete seeded rows |
+| 0010 | seed: 5 categories, 4 box themes, **6** theme-category links, 25 products | delete seeded rows |
 | 0011 | seed: `store_settings` singleton (+ null social columns) | delete row |
 | 0012 | seed: `email_settings` rows (empty copy pending owner export) | delete rows |
 
@@ -496,7 +497,7 @@ Supabase's backup features depend on plan tier (verify against Supabase's curren
 **A. Schema integrity**
 - [ ] All 11 tables exist with **RLS enabled** (`relrowsecurity = true`).
 - [ ] Enums present with exact values, incl. `reservation_status` and `email_log_status`.
-- [ ] Seed counts: `categories=5`, `box_themes=4`, `box_theme_categories=7` links, `products=25`, `store_settings=1`.
+- [ ] Seed counts: `categories=5`, `box_themes=4`, `box_theme_categories=`**6**` links` (Shine On→[accessories,beauty] · Cosy Home→[home] · Desk & Dream→[books-stationery] · Self-Care Sunday→[beauty,gifts]), `products=25`, `store_settings=1`.
 - [ ] No `media.base44.com` strings remain in any row.
 
 **B. Authorization / RLS (negative tests with the anon + a customer key)**
@@ -662,9 +663,10 @@ An idempotency key is **never a global handle** — it is scoped, payload-bound 
 
 **Grants & schema:**
 - **Every** function gets `revoke all … from public` (Postgres grants `EXECUTE` to `PUBLIC` by default) before targeted grants (§6.3).
-- **Table-level:** `anon`/`authenticated` receive only `SELECT` on public catalogue tables; **`INSERT`/`UPDATE`/`DELETE` are revoked** on `orders` (only `create_order` writes). Column-level `UPDATE` is **revoked** on `orders.status`, `orders.payment_status`, `orders.user_id`, `orders.paid_at` for client roles — so even a misconfigured RLS row policy cannot let a customer set them.
+- **Table-level:** `anon`/`authenticated` receive only `SELECT` on public catalogue tables; on `orders` **`INSERT` is revoked** (only `create_order` writes) and the **table-wide `UPDATE` is revoked**, with `UPDATE` granted only on the safe columns (`customer_name, customer_email, phone, address, city, province, postal_code, gift_note`). `DELETE` is granted to `authenticated` but RLS restricts it to admins. The payment/ownership columns (`status`, `payment_status`, `user_id`, `paid_at`, `total`, …) are therefore **not updatable** by any client role — so even a misconfigured RLS row policy cannot let a customer set them.
 - **Sequence:** `USAGE, UPDATE ON SEQUENCE order_reference_seq` is **revoked** from `anon`/`authenticated` (prevents burning references); the definer `create_order` uses it internally.
-- **`stock_reservations` / `payment_events`:** **no** client `SELECT`/`INSERT`/`UPDATE` grant at all (belt-and-braces on top of RLS deny) — customers cannot read or modify reservation data (review point 5).
+- **`stock_reservations` / `payment_events`:** clients receive **no `INSERT`/`UPDATE`** grant at all; `authenticated` holds `SELECT`+`DELETE` only and RLS restricts both to admins (`is_admin()`), so a non-admin customer reads **0 rows** and deletes nothing; `anon` has **no** grant. Reservation/payment data therefore cannot be read or modified by non-admins (review point 5).
+- **`service_role` (A2-1):** hosted Supabase no longer grants default privileges on new `public` objects (enforced **2026-10-30**; opt-in since 2026-04-28, default for new projects 2026-05-30). Every `service_role` privilege is therefore stated **explicitly** in the owning migration, with least privilege: **`SELECT` on all 11 tables** plus only the writes the server needs (`UPDATE` on `profiles` for role provisioning §11; `INSERT`/`UPDATE` on `email_logs`). It has **no** direct DML on `orders`/`stock_reservations`/`payment_events`/catalogue/settings, and **no** direct sequence grant — every write goes through the `SECURITY DEFINER` functions. `EXECUTE`: `create_order` + `settle_order` only. New **functions** still default to `PUBLIC EXECUTE`, which the migrations remove with `revoke … from public`.
 - **Views:** there are **none** in this design. Rule for future: any view must be created `WITH (security_invoker = true)` so it inherits RLS — a default (definer) view would bypass RLS and is prohibited.
 - **Owner:** all definer objects owned by the migration role, never `anon`/`authenticated`.
 
@@ -706,6 +708,19 @@ An idempotency key is **never a global handle** — it is scoped, payload-bound 
 ```
 Each rollback file states its **preconditions** (dependent objects already removed) and is executed **explicitly by filename** — never as inline comments (§13).
 
+**Rollback execution & migration-history reconciliation (A8-2):**
+The rollbacks under `supabase/rollback/` are **raw SQL** (run with `psql`), whereas the Supabase CLI records applied versions in the `supabase_migrations.schema_migrations` table (`version` = the numeric filename prefix, e.g. `0009`). **A raw-SQL rollback does not touch that table**, so after a rollback the recorded history no longer matches the live schema. If a later `supabase db push` runs in that state, the CLI believes those versions are already applied and **skips them**, silently leaving objects missing. Reconcile as follows:
+
+1. **Before rollback** — capture the recorded history: `select version from supabase_migrations.schema_migrations order by version;`.
+2. **Roll back** — run the rollback file(s) in reverse dependency order (see the graph above).
+3. **Reconcile history** — use the CLI's supported repair command, one version at a time:
+   `supabase migration repair --status reverted 0009` (repeat for each reverted version).
+   This updates `schema_migrations` **without** touching the database. (Equivalent raw SQL, if the CLI is unavailable: `delete from supabase_migrations.schema_migrations where version in ('0009', …);` — this only edits bookkeeping.)
+4. **Re-apply** — `supabase db push` (or `migration up`) now re-applies the reverted versions and re-records them.
+5. **Verify** — the recorded versions line up exactly with `supabase/migrations/*.sql`, and the schema/seed object counts match §15 A.
+
+> ⚠ **This procedure is documented and verified only in the scratch/test harness** (`scripts/test/06_rollback_bookkeeping.sh`). It must **not** be run against a production project without a fresh manual dump first (§14, decision B4). No `supabase db push` and no production connection are performed in Stage 3/3.1.
+
 **Practical security test procedure:**
 1. **Setup:** scratch Supabase project (or local `supabase start`); apply migrations `0000–0012` via `supabase db push`; capture three keys: anon, a service-role (server-only), and one customer login.
 2. **`scripts/verify-schema.ts`** (service role) — schema, enums, seed counts, `relrowsecurity`, function `acl`/`proconfig` (checklist §15 A, C, H).
@@ -744,7 +759,7 @@ Each rollback file states its **preconditions** (dependent objects already remov
 - [ ] `0007` `store_settings`
 - [ ] `0008` `email_settings` · `email_logs` (`order_id` FK)
 - [ ] `0009` `create_order` · `get_order_by_token` · `settle_order` · `release_expired_reservations` · `reassign_products_category` (+ hardening: `revoke from public`, grants, pinned `search_path`, schema-qualified)
-- [ ] `0010` seed categories · box themes · theme-category links (**7**) · **25** products (verbatim snapshots)
+- [ ] `0010` seed categories · box themes · theme-category links (**6**) · **25** products (verbatim snapshots)
 - [ ] `0011` seed `store_settings` singleton (delivery **R100**, null social)
 - [ ] `0012` seed `email_settings` (verbatim export if available, else empty — N2)
 - [ ] matching `supabase/rollback/NNNN_*.sql` for every migration, with stated preconditions

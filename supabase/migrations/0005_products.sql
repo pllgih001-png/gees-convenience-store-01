@@ -43,3 +43,6 @@ create policy products_delete_admin on public.products
 
 grant select on public.products to anon, authenticated;
 grant insert, update, delete on public.products to authenticated;
+
+-- service_role (server-only): read access for server-side/admin reads (A2-1).
+grant select on public.products to service_role;

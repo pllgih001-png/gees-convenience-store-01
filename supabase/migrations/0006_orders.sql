@@ -151,3 +151,15 @@ revoke update on public.orders from anon, authenticated;
 grant update (customer_name, customer_email, phone, address, city, province,
               postal_code, gift_note)
   on public.orders to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- service_role (trusted server role, server-only) — A2-1.
+-- Hosted Supabase no longer grants default privileges on new public objects
+-- (enforced 2026-10-30), so every service_role privilege is stated explicitly.
+-- The server READS orders / reservations / payment events (admin + settlement
+-- workflows §20). It is NOT granted INSERT/UPDATE/DELETE here: order creation,
+-- stock holds and payment settlement all run inside the SECURITY DEFINER
+-- functions in 0009 (owned by the migration role), so no direct DML is required.
+-- ---------------------------------------------------------------------------
+grant select on public.orders, public.stock_reservations, public.payment_events
+  to service_role;

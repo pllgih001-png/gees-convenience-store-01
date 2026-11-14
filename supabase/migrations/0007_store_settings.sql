@@ -40,3 +40,7 @@ create policy store_settings_delete_admin on public.store_settings
 
 grant select on public.store_settings to anon, authenticated;
 grant insert, update, delete on public.store_settings to authenticated;
+
+-- service_role (server-only): the server reads the singleton for delivery-fee and
+-- store metadata (A2-1). Edits stay with the admin (authenticated) RLS policies.
+grant select on public.store_settings to service_role;

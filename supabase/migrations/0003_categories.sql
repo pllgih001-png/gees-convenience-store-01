@@ -41,3 +41,8 @@ create policy categories_delete_admin on public.categories
 
 grant select on public.categories to anon, authenticated;
 grant insert, update, delete on public.categories to authenticated;
+
+-- service_role (trusted server role, server-only): read access for server-side
+-- rendering/admin reads. Catalogue writes stay with the admin (authenticated) RLS
+-- policies above, so no write grant is given to service_role (A2-1).
+grant select on public.categories to service_role;

@@ -78,10 +78,22 @@ select pg_temp.rec('A2 enums_exact',
 select pg_temp.rec('A3 seed_counts',
   (select (select count(*) from public.categories) = 5
      and (select count(*) from public.box_themes) = 4
+     and (select count(*) from public.box_theme_categories) = 6
      and (select count(*) from public.products) = 25
      and (select count(*) from public.store_settings) = 1
      and (select count(*) from public.email_settings) = 8),
-  'categories=5 box_themes=4 products=25 store_settings=1 email_settings=8');
+  'categories=5 box_themes=4 box_theme_categories=6 products=25 store_settings=1 email_settings=8');
+
+-- A3b (A1-1): the theme→category links match the authoritative Base44 snapshot
+-- (BoxTheme entity API), not a guessed count. Each theme's set of slugs is exact.
+select pg_temp.rec('A3b theme_category_links_exact',
+  (select coalesce(
+     (select string_agg(bt.name || '={' || (select string_agg(btc.category_slug, ',' order by btc.category_slug)
+                                             from public.box_theme_categories btc where btc.box_theme_id = bt.id) || '}',
+                        ' ' order by bt.name)
+        from public.box_themes bt)
+       , '') = 'Cosy Home={home} Desk & Dream={books-stationery} Self-Care Sunday={beauty,gifts} Shine On={accessories,beauty}'),
+  'BoxTheme source: Shine On[accessories,beauty] Cosy Home[home] Desk & Dream[books-stationery] Self-Care Sunday[beauty,gifts]');
 
 select pg_temp.note('A4 no_base44_asset_urls', 'N/A (Stage 11)',
   (select count(*)::text || ' products still reference media.base44.com; asset migration is deferred to Stage 11' from public.products where image_url like '%media.base44.com%'));
@@ -199,6 +211,14 @@ select pg_temp.rec('C1 anon_execute_only_get_order_by_token',
    and not has_function_privilege('anon', 'public.settle_order(uuid,public.payment_status,text)', 'EXECUTE')),
   'anon: create_order=F get_order_by_token=T settle_order=F');
 
+-- C1b (A2-2): settlement is server-only — NEITHER anon NOR authenticated may
+-- execute settle_order; only service_role can (the payment boundary, §18/§20).
+select pg_temp.rec('C1b settle_order_service_role_only',
+  (not has_function_privilege('anon', 'public.settle_order(uuid,public.payment_status,text)', 'EXECUTE')
+   and not has_function_privilege('authenticated', 'public.settle_order(uuid,public.payment_status,text)', 'EXECUTE')
+   and has_function_privilege('service_role', 'public.settle_order(uuid,public.payment_status,text)', 'EXECUTE')),
+  'anon=F authenticated=F service_role=T');
+
 select pg_temp.rec('C2 no_public_execute_on_definer_fns',
   (select count(*) = 0 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
     where n.nspname = 'public' and p.prosecdef and p.proname in
@@ -222,6 +242,82 @@ select pg_temp.rec('C4 definer_fns_not_owned_by_client_roles',
     join pg_roles r on r.oid = p.proowner
     where n.nspname = 'public' and p.prosecdef and r.rolname in ('anon','authenticated','service_role')),
   'owner must be the migration role');
+
+-- ===========================================================================
+-- C5. service_role privileges (A2-1)
+-- Hosted Supabase no longer grants default privileges on new public objects
+-- (enforced 2026-10-30); the shim models that by setting NO default privileges,
+-- so every service_role privilege below must come from an explicit `grant` in
+-- the owning migration. These assertions fail if any grant is missing OR if a
+-- blanket grant was added unnecessarily.
+-- ===========================================================================
+select pg_temp.rec('C5a service_role_select_all_tables',
+  (has_table_privilege('service_role','public.profiles','SELECT')
+   and has_table_privilege('service_role','public.categories','SELECT')
+   and has_table_privilege('service_role','public.box_themes','SELECT')
+   and has_table_privilege('service_role','public.box_theme_categories','SELECT')
+   and has_table_privilege('service_role','public.products','SELECT')
+   and has_table_privilege('service_role','public.orders','SELECT')
+   and has_table_privilege('service_role','public.stock_reservations','SELECT')
+   and has_table_privilege('service_role','public.payment_events','SELECT')
+   and has_table_privilege('service_role','public.store_settings','SELECT')
+   and has_table_privilege('service_role','public.email_settings','SELECT')
+   and has_table_privilege('service_role','public.email_logs','SELECT')),
+  'service_role SELECT on all 11 public tables (server-side reads)');
+
+select pg_temp.rec('C5b service_role_write_only_where_required',
+  (has_table_privilege('service_role','public.profiles','UPDATE')
+   and has_table_privilege('service_role','public.email_logs','INSERT')
+   and has_table_privilege('service_role','public.email_logs','UPDATE')),
+  'profiles UPDATE (role provisioning §11); email_logs INSERT/UPDATE (log lifecycle)');
+
+select pg_temp.rec('C5c service_role_no_blanket_dml',
+  (not has_table_privilege('service_role','public.orders','INSERT')
+   and not has_table_privilege('service_role','public.orders','UPDATE')
+   and not has_table_privilege('service_role','public.orders','DELETE')
+   and not has_table_privilege('service_role','public.stock_reservations','INSERT')
+   and not has_table_privilege('service_role','public.stock_reservations','UPDATE')
+   and not has_table_privilege('service_role','public.stock_reservations','DELETE')
+   and not has_table_privilege('service_role','public.payment_events','INSERT')
+   and not has_table_privilege('service_role','public.payment_events','UPDATE')
+   and not has_table_privilege('service_role','public.categories','INSERT')
+   and not has_table_privilege('service_role','public.categories','UPDATE')
+   and not has_table_privilege('service_role','public.categories','DELETE')
+   and not has_table_privilege('service_role','public.products','INSERT')
+   and not has_table_privilege('service_role','public.products','UPDATE')
+   and not has_table_privilege('service_role','public.products','DELETE')
+   and not has_table_privilege('service_role','public.box_themes','INSERT')
+   and not has_table_privilege('service_role','public.box_theme_categories','INSERT')
+   and not has_table_privilege('service_role','public.store_settings','INSERT')
+   and not has_table_privilege('service_role','public.store_settings','UPDATE')
+   and not has_table_privilege('service_role','public.store_settings','DELETE')
+   and not has_table_privilege('service_role','public.profiles','INSERT')
+   and not has_table_privilege('service_role','public.profiles','DELETE')
+   and not has_table_privilege('service_role','public.email_settings','UPDATE')),
+  'no DML on orders/reservations/events; all other writes go through definer fns');
+
+select pg_temp.rec('C5d service_role_execute_boundary',
+  (has_function_privilege('service_role','public.create_order(jsonb,uuid,text,text)','EXECUTE')
+   and has_function_privilege('service_role','public.settle_order(uuid,public.payment_status,text)','EXECUTE')
+   and not has_function_privilege('service_role','public.reassign_products_category(text,text)','EXECUTE')),
+  'service_role: create_order + settle_order only (order + settlement boundary)');
+
+select pg_temp.rec('C5e service_role_no_sequence_privilege',
+  (not has_sequence_privilege('service_role','public.order_reference_seq','USAGE')
+   and not has_sequence_privilege('service_role','public.order_reference_seq','UPDATE')),
+  'next_order_reference() is SECURITY DEFINER; service_role needs no sequence grant');
+
+select pg_temp.rec('C5f client_order_privileges_restricted',
+  (not has_table_privilege('anon','public.orders','INSERT')
+   and not has_table_privilege('authenticated','public.orders','INSERT')
+   and not has_column_privilege('authenticated','public.orders','payment_status','UPDATE')
+   and not has_column_privilege('authenticated','public.orders','status','UPDATE')
+   and not has_column_privilege('authenticated','public.orders','user_id','UPDATE')
+   and not has_column_privilege('authenticated','public.orders','paid_at','UPDATE')
+   and has_column_privilege('authenticated','public.orders','customer_name','UPDATE')
+   and not has_sequence_privilege('anon','public.order_reference_seq','USAGE')
+   and not has_sequence_privilege('authenticated','public.order_reference_seq','USAGE')),
+  'clients cannot INSERT orders or set payment/ownership columns; safe columns only');
 
 -- ===========================================================================
 -- D. Order integrity
@@ -399,6 +495,66 @@ do $$ declare pid uuid; res jsonb; o uuid; before int; after int; begin
     'stock ' || before || '->' || after);
 end $$;
 
+-- F5 (A4-1) duplicate product lines cannot collectively over-reserve.
+-- Product stock 5; the basket lists the SAME product twice, 3 + 3 = 6 > 5.
+-- A per-line availability check would pass BOTH lines against the same `held`
+-- snapshot; the aggregated check must reject the whole order.
+do $$ declare pid uuid; begin
+  perform pg_temp.as_super();
+  delete from public.stock_reservations;
+  select id into pid from public.products where visible order by sort_order, name offset 23 limit 1;
+  update public.products set stock = 5 where id = pid;
+
+  perform pg_temp.as_role('service_role', '{"role":"service_role"}');
+  perform pg_temp.rec('F5a duplicate_lines_over_stock_rejected',
+    pg_temp.try(format('select public.create_order(''{"items":[{"product_id":"%s","quantity":3},{"product_id":"%s","quantity":3}]}''::jsonb, ''f5000000-0000-0000-0000-000000000001''::uuid, ''g:f5a'', null)', pid, pid)) <> 'OK');
+  perform pg_temp.as_super();
+  perform pg_temp.rec('F5b no_order_or_reservation_written',
+    (select count(*) = 0 from public.orders where idempotency_owner = 'g:f5a')
+    and (select count(*) = 0 from public.stock_reservations where product_id = pid),
+    'rejected order left no rows behind');
+end $$;
+
+-- F5c duplicate lines that DO fit (3 + 2 = 5 <= stock 5) are accepted, and the
+-- per-line reservations (the existing lifecycle) are both held.
+do $$ declare pid uuid; res jsonb; o uuid; held int; begin
+  perform pg_temp.as_super();
+  delete from public.stock_reservations;
+  select id into pid from public.products where visible order by sort_order, name offset 23 limit 1;
+  update public.products set stock = 5 where id = pid;
+
+  perform pg_temp.as_role('service_role', '{"role":"service_role"}');
+  res := public.create_order(
+    format('{"items":[{"product_id":"%s","quantity":3},{"product_id":"%s","quantity":2}]}', pid, pid)::jsonb,
+    'f5000000-0000-0000-0000-000000000002'::uuid, 'g:f5c', null);
+  select id into o from public.orders where order_reference = res ->> 'order_reference';
+  select coalesce(sum(quantity),0) into held from public.stock_reservations where order_id = o and status = 'held';
+  perform pg_temp.rec('F5c duplicate_lines_within_stock_accepted',
+    held = 5 and (res ->> 'order_reference') is not null, 'held=' || held);
+  perform pg_temp.as_super();
+end $$;
+
+-- F6 (A4-1) race for the last units of one product. Stock 3; two requests each
+-- order the same product as 1 + 1 (duplicate lines). A per-line check would let
+-- both pass; the aggregate + row lock must let exactly ONE succeed.
+-- Both calls run here in one transaction so the second call observes the first
+-- call's held rows — a deterministic proof of the aggregate; a truly-concurrent
+-- two-session drill is run separately by scripts/test/05_stock_concurrency.sh.
+do $$ declare pid uuid; a_ok boolean; b_ok boolean; held int; begin
+  perform pg_temp.as_super();
+  delete from public.stock_reservations;
+  select id into pid from public.products where visible order by sort_order, name offset 24 limit 1;
+  update public.products set stock = 3 where id = pid;
+
+  perform pg_temp.as_role('service_role', '{"role":"service_role"}');
+  a_ok := pg_temp.try(format('select public.create_order(''{"items":[{"product_id":"%s","quantity":1},{"product_id":"%s","quantity":1}]}''::jsonb, ''f6000000-0000-0000-0000-000000000001''::uuid, ''g:f6a'', null)', pid, pid)) = 'OK';
+  b_ok := pg_temp.try(format('select public.create_order(''{"items":[{"product_id":"%s","quantity":1},{"product_id":"%s","quantity":1}]}''::jsonb, ''f6000000-0000-0000-0000-000000000002''::uuid, ''g:f6b'', null)', pid, pid)) = 'OK';
+  select coalesce(sum(quantity),0) into held from public.stock_reservations where product_id = pid and status = 'held';
+  perform pg_temp.rec('F6 second_request_for_last_units_rejected',
+    a_ok and not b_ok and held = 2, 'a=' || a_ok || ' b=' || b_ok || ' held=' || held);
+  perform pg_temp.as_super();
+end $$;
+
 -- ===========================================================================
 -- G. Payments
 -- ===========================================================================
@@ -515,6 +671,9 @@ do $$ declare pid uuid; orig jsonb; begin
   perform pg_temp.as_role('service_role', '{"role":"service_role"}');
   orig := public.create_order(format('{"items":[{"product_id":"%s","quantity":1}]}', pid)::jsonb,
         'c6000000-0000-0000-0000-000000000001'::uuid, 'g:before', null);
+  -- Guest retrieval is an anon/authenticated call (get_order_by_token is granted
+  -- to those roles, not service_role); the grace cookie must grant no read access.
+  perform pg_temp.as_role('anon', '{"role":"anon"}');
   perform pg_temp.rec('G6 grace_no_read_access',
     public.get_order_by_token('00000000-0000-0000-0000-0000000000aa'::uuid) is null);
   perform pg_temp.as_super();

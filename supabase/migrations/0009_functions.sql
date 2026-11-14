@@ -59,6 +59,7 @@ declare
   v_price        numeric(10,2);
   v_avail        int;
   v_held         int;
+  v_agg          int;
   v_order_id     uuid;
   v_ref          text;
   v_token        uuid;
@@ -135,7 +136,7 @@ begin
     perform 1 from public.products p where p.id = v_pid for update;
   end loop;
 
-  -- ── Validate each line, recompute prices from the DB, check availability ──
+  -- ── Validate each line, recompute prices from the DB ─────────────────────
   for v_item in select value from jsonb_array_elements(v_items) loop
     v_pid := (v_item ->> 'product_id')::uuid;
     v_qty := coalesce((v_item ->> 'quantity')::int, 0);
@@ -154,19 +155,36 @@ begin
       raise exception 'product_unavailable' using errcode = '22023';
     end if;
 
+    v_subtotal := v_subtotal + (v_price * v_qty);
+  end loop;
+
+  v_total := v_subtotal + v_fee;
+
+  -- ── Availability check, AGGREGATED PER PRODUCT (A4-1) ────────────────────
+  -- The same product may legitimately appear on several lines (Build-a-Box and
+  -- the cart both allow repeats). Availability MUST be validated against the
+  -- TOTAL quantity per product, not line-by-line: two lines of 3 units each
+  -- would otherwise both pass a per-line check against the same `held` snapshot
+  -- and together over-reserve a product whose stock is 5. Aggregating first
+  -- makes the check exact and conservative — sum(qty per product) must fit in
+  -- stock − held(committed elsewhere). Rows are already locked above, so no
+  -- concurrent writer can change `stock` between this check and the inserts.
+  for v_pid, v_agg in
+    select (e.value ->> 'product_id')::uuid,
+           sum((e.value ->> 'quantity')::int)::int
+      from jsonb_array_elements(v_items) e
+     group by 1
+     order by 1
+  loop
     select coalesce(sum(r.quantity), 0) into v_held
       from public.stock_reservations r
      where r.product_id = v_pid and r.status = 'held' and r.expires_at > now();
 
     select p.stock into v_avail from public.products p where p.id = v_pid;
-    if v_avail - v_held < v_qty then
+    if v_avail - v_held < v_agg then
       raise exception 'insufficient_stock' using errcode = 'P0001';
     end if;
-
-    v_subtotal := v_subtotal + (v_price * v_qty);
   end loop;
-
-  v_total := v_subtotal + v_fee;
 
   -- ── Insert the order with forced literals; ownership from the server ──────
   insert into public.orders (
@@ -298,7 +316,11 @@ begin
 end
 $$;
 revoke all on function public.settle_order(uuid, public.payment_status, text) from public;
-grant execute on function public.settle_order(uuid, public.payment_status, text) to authenticated, service_role;
+-- A2-2: settlement is a SERVER-ONLY operation. The server verifies the gateway
+-- outcome and calls settle_order with the service-role key (§18, §20). It is NOT
+-- granted to `authenticated` (or `anon`): a signed-in customer/admin never settles
+-- directly from the browser — the payment boundary is the service-role route.
+grant execute on function public.settle_order(uuid, public.payment_status, text) to service_role;
 
 -- ---------------------------------------------------------------------------
 -- reassign_products_category — admin-only; used before deleting a category.

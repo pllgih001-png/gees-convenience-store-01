@@ -49,3 +49,10 @@ grant select, insert, update, delete on public.email_settings to authenticated;
 grant select, update, delete on public.email_logs to authenticated;
 -- Logs are inserted by the server only (service role bypasses RLS).
 revoke insert on public.email_logs from anon, authenticated;
+
+-- service_role (trusted server role, server-only) — A2-1. Hosted Supabase no
+-- longer grants default privileges on new public objects (enforced 2026-10-30).
+-- The server reads templates to send and owns the email-log lifecycle; templates
+-- themselves are edited by the admin (authenticated) RLS policies above.
+grant select on public.email_settings to service_role;
+grant select, insert, update on public.email_logs to service_role;

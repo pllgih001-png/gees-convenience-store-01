@@ -49,3 +49,6 @@ create policy box_theme_categories_delete_admin on public.box_theme_categories
 
 grant select on public.box_themes, public.box_theme_categories to anon, authenticated;
 grant insert, update, delete on public.box_themes, public.box_theme_categories to authenticated;
+
+-- service_role (server-only): read access for server-side/admin reads (A2-1).
+grant select on public.box_themes, public.box_theme_categories to service_role;

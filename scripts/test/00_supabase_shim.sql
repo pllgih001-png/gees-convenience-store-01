@@ -20,13 +20,26 @@ end $$;
 
 grant usage on schema public to anon, authenticated, service_role;
 
--- Real Supabase grants service_role broad privileges on the public schema (it is
--- the trusted server role and also BYPASSRLS). Emulate that so server-side
--- functions/paths behave as they would on a real project. Applies to objects
--- created AFTER this point (i.e. the migrations).
-alter default privileges in schema public grant all on tables to service_role;
-alter default privileges in schema public grant all on sequences to service_role;
-alter default privileges in schema public grant all on functions to service_role;
+-- ---------------------------------------------------------------------------
+-- A2-1: model the CURRENT hosted Supabase default-privilege behaviour.
+--
+-- Supabase is removing the automatic grants that previously applied to new
+-- objects in the `public` schema, making Data-API exposure opt-in. This is the
+-- platform default for new projects and is enforced for ALL existing projects
+-- on 2026-10-30:
+--   * new tables/views  -> no automatic grant to anon / authenticated / service_role
+--   * new sequences     -> no automatic grant to those roles
+--   * new functions     -> still callable via the global PUBLIC EXECUTE default,
+--                          which the migrations remove with `revoke ... from public`
+-- Docs: https://supabase.com/docs/guides/api/securing-your-api ("Default privileges")
+--       https://supabase.com/changelog/45329-breaking-change-tables-not-exposed-to-data-and-graphql-api-automatically
+--
+-- Therefore this shim intentionally sets NO default privileges: every role
+-- privilege on a migration-created object must come from an explicit `grant` in
+-- the migration itself. (An earlier revision granted `all` to service_role via
+-- default privileges, which diverged from hosted Supabase and masked missing
+-- grants — that is the divergence this file now avoids.)
+-- ---------------------------------------------------------------------------
 
 -- auth schema: users table + uid()/jwt() helpers backed by the request GUC.
 create schema if not exists auth;
